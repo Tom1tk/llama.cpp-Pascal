@@ -550,21 +550,10 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
 #pragma unroll
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
-#if defined(GGML_PASCAL_FA_KQ_H2) && defined(FAST_FP16_AVAILABLE) && !defined(V_DOT2_F32_F16_AVAILABLE)
-                // Pascal fork P5: accumulate cpy_ne half2 products with __hfma2, flush to the fp32 accumulator once.
-                half2 acc_h2 = make_half2(0.0f, 0.0f);
-#pragma unroll
-                for (int k = 0; k < cpy_ne; ++k) {
-                    acc_h2 = __hfma2(K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k], acc_h2);
-                }
-                const float2 acc_f2 = __half22float2(acc_h2);
-                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] += acc_f2.x + acc_f2.y;
-#else
 #pragma unroll
                 for (int k = 0; k < cpy_ne; ++k) {
                     ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
                 }
-#endif // GGML_PASCAL_FA_KQ_H2
             }
         }
     }

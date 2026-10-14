@@ -2690,6 +2690,12 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
+// Pascal fork (D1): opt back into CUDA graphs on cc < Volta; upstream's gate was a perf call, not correctness.
+static bool ggml_cuda_pascal_graphs_enabled() {
+    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_PASCAL_GRAPHS");
+    return enabled;
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -4669,7 +4675,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA && !ggml_cuda_pascal_graphs_enabled()) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }

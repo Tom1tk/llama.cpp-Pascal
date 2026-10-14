@@ -21,6 +21,15 @@
 
 #define MMVH_NWARPS 4
 
+// H41: Q6_K with 4 lanes per superblock (64 weights each) instead of 8, opt-in.
+static bool mmvh_q6k_wide_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_PASCAL_MMVH_Q6K_WIDE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool mmvh_env_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_PASCAL_MMVH");
@@ -187,6 +196,58 @@ __device__ __forceinline__ void mmvh_load<GGML_TYPE_Q6_K>(const char * __restric
     }
 }
 
+// Q6_K, 4 units of 16 weights per lane: the lane owns ql[l0..l0+15], ql[l0+32..l0+47] and
+// qh[l0..l0+15] of one 128-half, so no byte is fetched by two lanes (the 8-lane split reads
+// every qh byte 4x and every ql byte 2x, with 2-byte loads).
+struct mmvh_units4 {
+    int   b[4][4];
+    int   blk[4];
+    int   hf[4];
+    float ws[4];
+    float mt[4];
+};
+
+// 16 bytes at a 2-byte aligned address: 5 aligned 4-byte loads + funnel shifts, branch-free.
+// Reads up to 4 bytes past the end; every caller stays inside its block_q6_K.
+static __device__ __forceinline__ void mmvh_load16_b2(const uint8_t * p, int * out) {
+    const uintptr_t a  = (uintptr_t) p;
+    const int     * q  = (const int *) (a & ~uintptr_t(3));
+    const int       sh = (a & 2) * 8;
+    int w[5];
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        w[i] = q[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        out[i] = __funnelshift_r(w[i], w[i + 1], sh);
+    }
+}
+
+static __device__ __forceinline__ void mmvh_load_q6_K_wide(const char * __restrict__ row, const int sb, const int sub, mmvh_units4 & u) {
+    const block_q6_K * bq = (const block_q6_K *) row + sb;
+    const int n  = sub >> 1;
+    const int hf = sub & 1;
+    const int l0 = 16*hf;
+    int qa[4], qb[4], qh[4];
+    mmvh_load16_b2(bq->ql + 64*n + l0,      qa);
+    mmvh_load16_b2(bq->ql + 64*n + 32 + l0, qb);
+    mmvh_load16_b2(bq->qh + 32*n + l0,      qh);
+    const float d = __half2float(bq->d);
+#pragma unroll
+    for (int qd = 0; qd < 4; ++qd) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int ql = (qd & 1 ? qb[i] : qa[i]) >> (4*(qd >> 1));
+            u.b[qd][i] = (ql & 0x0F0F0F0F) | (((qh[i] >> (2*qd)) & 0x03030303) << 4);
+        }
+        u.blk[qd] = 4*n + qd;
+        u.hf[qd]  = hf;
+        u.ws[qd]  = d * bq->scales[8*n + 2*qd + hf];
+        u.mt[qd]  = 32.0f * u.ws[qd];
+    }
+}
+
 // kvalues_iq4nl + 128, as bytes: every table value becomes a non-negative byte
 static __device__ __forceinline__ int2 mmvh_iq4nl_lookup(const int q4) {
     const uint32_t t0 = 0x3f2d1801, t1 = 0x766a5d4f, t2 = 0xa6998d81, t3 = 0xf1d9c5b5;
@@ -293,7 +354,8 @@ __device__ __forceinline__ void mmvh_load<GGML_TYPE_IQ3_XXS>(const char * __rest
 // --- matvec ------------------------------------------------------------------
 
 // R = rows per warp: the activation loads are shared across them
-template <ggml_type type, int ncols, int R>
+// NU = units of 16 weights per lane (4 only for the H41 Q6_K path)
+template <ggml_type type, int ncols, int R, int NU>
 __launch_bounds__(MMVH_NWARPS*WARP_SIZE, 1)
 static __global__ void mul_mat_vec_h(const char * __restrict__ vx, const half * __restrict__ xh, const float4 * __restrict__ meta,
         float * __restrict__ dst, const int nsb, const int nrows, const int64_t stride_row_x,
@@ -310,7 +372,8 @@ static __global__ void mul_mat_vec_h(const char * __restrict__ vx, const half * 
         return;
     }
     const int lane = threadIdx.x;
-    const int sub  = lane & 7;
+    constexpr int lps = QK_K / (16*NU); // lanes per superblock
+    const int sub  = lane & (lps - 1);
 
     const char * xrow[R];
 #pragma unroll
@@ -320,15 +383,19 @@ static __global__ void mul_mat_vec_h(const char * __restrict__ vx, const half * 
 
     float tmp[ncols][R] = {{0.0f}};
 
-    for (int sb = lane >> 3; sb < nsb; sb += WARP_SIZE/8) {
-        mmvh_units u[R];
+    for (int sb = lane / lps; sb < nsb; sb += WARP_SIZE/lps) {
+        std::conditional_t<NU == 4, mmvh_units4, mmvh_units> u[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) {
-            mmvh_load<type>(xrow[r], sb, sub, u[r]);
+            if constexpr (NU == 4) {
+                mmvh_load_q6_K_wide(xrow[r], sb, sub, u[r]);
+            } else {
+                mmvh_load<type>(xrow[r], sb, sub, u[r]);
+            }
         }
 
 #pragma unroll
-        for (int k = 0; k < 2; ++k) {
+        for (int k = 0; k < NU; ++k) {
             const int64_t i0 = int64_t(sb)*QK_K + 32*u[0].blk[k] + 16*u[0].hf[k];
 #pragma unroll
             for (int c = 0; c < ncols; ++c) {
@@ -368,22 +435,22 @@ static __global__ void mul_mat_vec_h(const char * __restrict__ vx, const half * 
     }
 }
 
-template <ggml_type type, int ncols>
+template <ggml_type type, int ncols, int NU>
 static void mul_mat_vec_h_launch(const char * vx, const half * xh, const float4 * meta, float * dst, const int nsb,
         const int64_t nrows, const int64_t stride_row_x, const int64_t ncols_padded, const int64_t stride_col_dst, cudaStream_t stream) {
     constexpr int R = ncols <= 4 ? 4 : 2;
     const dim3 grid((nrows + MMVH_NWARPS*R - 1) / (MMVH_NWARPS*R));
     const dim3 block(WARP_SIZE, MMVH_NWARPS);
-    mul_mat_vec_h<type, ncols, R><<<grid, block, 0, stream>>>(vx, xh, meta, dst, nsb, nrows, stride_row_x, ncols_padded, stride_col_dst);
+    mul_mat_vec_h<type, ncols, R, NU><<<grid, block, 0, stream>>>(vx, xh, meta, dst, nsb, nrows, stride_row_x, ncols_padded, stride_col_dst);
 }
 
-template <ggml_type type>
+template <ggml_type type, int NU = 2>
 static void mul_mat_vec_h_cuda(const char * vx, const half * xh, const float4 * meta, float * dst, const int64_t ne00,
         const int64_t nrows, const int64_t ncols, const int64_t stride_row_x, const int64_t ncols_padded,
         const int64_t stride_col_dst, cudaStream_t stream) {
     const int nsb = ne00 / QK_K;
     switch (ncols) {
-#define MMVH_CASE(n) case n: mul_mat_vec_h_launch<type, n>(vx, xh, meta, dst, nsb, nrows, stride_row_x, ncols_padded, stride_col_dst, stream); break;
+#define MMVH_CASE(n) case n: mul_mat_vec_h_launch<type, n, NU>(vx, xh, meta, dst, nsb, nrows, stride_row_x, ncols_padded, stride_col_dst, stream); break;
         MMVH_CASE(1) MMVH_CASE(2) MMVH_CASE(3) MMVH_CASE(4)
         MMVH_CASE(5) MMVH_CASE(6) MMVH_CASE(7) MMVH_CASE(8)
 #undef MMVH_CASE
@@ -420,7 +487,11 @@ void ggml_cuda_mul_mat_vec_h(ggml_backend_cuda_context & ctx,
             mul_mat_vec_h_cuda<GGML_TYPE_Q5_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_Q6_K:
-            mul_mat_vec_h_cuda<GGML_TYPE_Q6_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            if (mmvh_q6k_wide_enabled()) {
+                mul_mat_vec_h_cuda<GGML_TYPE_Q6_K, 4>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            } else {
+                mul_mat_vec_h_cuda<GGML_TYPE_Q6_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            }
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_h_cuda<GGML_TYPE_IQ4_XS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);

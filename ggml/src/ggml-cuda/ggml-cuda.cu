@@ -1135,6 +1135,14 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
         return true;
     }
 
+    // GGML_PASCAL_AR_INTERNAL_MAX_BYTES: only reductions up to this size (decode, spec verify) take
+    // the internal path; larger ones fall back to the meta butterfly (P2P, F16, duplex) for prefill.
+    static const size_t max_bytes = getenv("GGML_PASCAL_AR_INTERNAL_MAX_BYTES") ?
+        strtoull(getenv("GGML_PASCAL_AR_INTERNAL_MAX_BYTES"), nullptr, 10) : SIZE_MAX;
+    if (ggml_nbytes(tensors[0]) > max_bytes) {
+        return false;
+    }
+
     for (size_t i = 0; i < n_backends; ++i) {
         if (tensors[i] == nullptr) {
             GGML_LOG_ERROR("%s: internal failed: tensor[%zu] is null\n", __func__, i);

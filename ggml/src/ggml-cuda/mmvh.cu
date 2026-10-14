@@ -40,6 +40,7 @@ bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, 
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ3_XXS:
@@ -158,6 +159,31 @@ __device__ __forceinline__ void mmvh_load<GGML_TYPE_Q5_K>(const char * __restric
         u.hf[k]  = sub & 1;
         u.ws[k]  = dm.x * sc;
         u.mt[k]  = dm.y * m;
+    }
+}
+
+template <>
+__device__ __forceinline__ void mmvh_load<GGML_TYPE_Q6_K>(const char * __restrict__ row, const int sb, const int sub, mmvh_units & u) {
+    const block_q6_K * bq = (const block_q6_K *) row + sb;
+    // 32-block sub = 128-half n, quadrant qd: low/high nibble of ql[l] / ql[l+32], qh bits 2*qd
+    const int n  = sub >> 2;
+    const int qd = sub & 3;
+    const float d = __half2float(bq->d);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        // block_q6_K is 210 bytes: only 2-byte alignment
+        const int ql0 = (64*n + 32*(qd & 1) + 16*k) / 4;
+        const int qh0 = (32*n + 16*k) / 4;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int ql = get_int_b2(bq->ql, ql0 + i) >> (4*(qd >> 1));
+            const int qh = get_int_b2(bq->qh, qh0 + i) >> (2*qd);
+            u.b[k][i] = (ql & 0x0F0F0F0F) | ((qh & 0x03030303) << 4);
+        }
+        u.blk[k] = sub;
+        u.hf[k]  = k;
+        u.ws[k]  = d * bq->scales[8*n + 2*qd + k];
+        u.mt[k]  = 32.0f * u.ws[k];
     }
 }
 
@@ -392,6 +418,9 @@ void ggml_cuda_mul_mat_vec_h(ggml_backend_cuda_context & ctx,
             break;
         case GGML_TYPE_Q5_K:
             mul_mat_vec_h_cuda<GGML_TYPE_Q5_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            mul_mat_vec_h_cuda<GGML_TYPE_Q6_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_h_cuda<GGML_TYPE_IQ4_XS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);

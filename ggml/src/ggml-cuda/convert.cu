@@ -275,15 +275,58 @@ static void dequantize_block_q8_0_f16_cuda(const void * __restrict__ vx, half * 
     }
 }
 
+// Pascal fork P3: GGML_PASCAL_DEQUANT_STAGED=1. The stock super-block kernels run one 32/64-thread CTA
+// per super-block (sm_60 holds 32 CTAs per SM, so 50% occupancy at 32 threads) and store 2-byte values
+// at a stride. Here a 256-thread CTA dequantizes 256/nthreads super-blocks into shared memory with the
+// same arithmetic, then writes them out as coalesced 16-byte stores. Output is bit-identical.
+template <int nthreads, void (*dequantize)(const void *, const int64_t, half *, const int)>
+static __global__ void dequantize_block_staged(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
+    constexpr int R = 256/nthreads;
+    __shared__ uint4 tile[R*QK_K/8];
+
+    const int64_t ib0 = int64_t(blockIdx.x)*R;
+    if (ib0 + threadIdx.y < nb) {
+        dequantize(vx, ib0 + threadIdx.y, (half *) tile + threadIdx.y*QK_K, threadIdx.x);
+    }
+    __syncthreads();
+
+    const int nvec = min(int64_t(R), nb - ib0)*QK_K/8;
+    uint4 * y = (uint4 *) (yy + ib0*QK_K);
+    for (int j = threadIdx.y*nthreads + threadIdx.x; j < nvec; j += 256) {
+        y[j] = tile[j];
+    }
+}
+
+template <int nthreads, void (*dequantize)(const void *, const int64_t, half *, const int), typename dst_t>
+static bool dequantize_row_staged_cuda(const void * vx, dst_t * y, const int64_t nb, cudaStream_t stream) {
+    static const bool staged = getenv("GGML_PASCAL_DEQUANT_STAGED") && atoi(getenv("GGML_PASCAL_DEQUANT_STAGED"));
+    if constexpr (std::is_same_v<dst_t, half>) {
+        // 64-thread kernels (q2_K, q3_K, q5_K, q6_K) already fill the SM; staging made q5_K 1.6% slower (H39).
+        if (nthreads == 32 && staged && uintptr_t(y) % 16 == 0) {
+            constexpr int R = 256/nthreads;
+            dequantize_block_staged<nthreads, dequantize><<<(nb + R - 1)/R, dim3(nthreads, R), 0, stream>>>(vx, y, nb);
+            return true;
+        }
+    }
+    GGML_UNUSED(vx); GGML_UNUSED(y); GGML_UNUSED(nb); GGML_UNUSED(stream);
+    return false;
+}
+
 template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<64, dequantize_q2_K<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_q3_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<64, dequantize_q3_K<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_q3_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
@@ -304,54 +347,81 @@ static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_q4_K<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_q4_K<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<64, dequantize_q5_K<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<64, dequantize_q6_K<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq2_xxs<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq2_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq2_xs<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq2_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq2_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq2_s<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq2_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_xxs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq3_xxs<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq3_xxs<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq3_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq3_s<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq3_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq1_s_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq1_s<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq1_s<<<nb, 32, 0, stream>>>(vx, y);
 }
 
@@ -365,12 +435,18 @@ static void dequantize_row_iq4_nl_cuda(const void * vx, dst_t * y, const int64_t
 template<typename dst_t>
 static void dequantize_row_iq1_m_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq1_m<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq1_m<<<nb, 32, 0, stream>>>(vx, y);
 }
 
 template<typename dst_t>
 static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = (k + QK_K - 1) / QK_K;
+    if (dequantize_row_staged_cuda<32, dequantize_iq4_xs<half>>(vx, y, nb, stream)) {
+        return;
+    }
     dequantize_block_iq4_xs<<<nb, 32, 0, stream>>>(vx, y);
 }
 

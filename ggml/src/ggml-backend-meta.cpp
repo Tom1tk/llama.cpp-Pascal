@@ -2220,7 +2220,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
                 const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
                 if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
+                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node) + 256); // +256: F16 reduce packs two halves
                 }
                 const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
@@ -2271,8 +2271,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
         if (max_nnodes_raised || n_subgraphs > backend_ctx->max_subgraphs) {
             backend_ctx->max_subgraphs = std::max(backend_ctx->max_subgraphs, n_subgraphs);
-            const size_t n_nodes_per_device = 3 * backend_ctx->n_reduce_steps; // tmp + ADD (+zeroing) graph per step and device
-            const size_t n_cgraphs_per_device = 2 * backend_ctx->n_reduce_steps; // ADD ( + zeroing) graph per step and device
+            // tmp + ADD (+zeroing), plus half + 2 CPY for the F16 reduce, per step and device
+            const size_t n_nodes_per_device = 6 * backend_ctx->n_reduce_steps;
+            // ADD (+zeroing), plus 2 CPY graphs for the F16 reduce, per step and device
+            const size_t n_cgraphs_per_device = 4 * backend_ctx->n_reduce_steps;
             const size_t mem_per_device_graphs_main = backend_ctx->max_subgraphs*ggml_graph_overhead_custom(backend_ctx->max_nnodes, cgraph->grads);
             const size_t mem_per_device_graphs_aux = n_cgraphs_per_device*backend_ctx->max_subgraphs*ggml_graph_overhead_custom(1, cgraph->grads);
             const size_t mem_per_device_nodes_aux = n_nodes_per_device*backend_ctx->max_subgraphs*ggml_tensor_overhead();
@@ -2378,6 +2380,56 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
+        // GGML_PASCAL_F16_REDUCE=1: large (prefill) partials cross PCIe as F16, half the bytes.
+        // Each card rounds its own partial to F16 too, so both cards end with identical sums.
+        static const bool f16_reduce = getenv("GGML_PASCAL_F16_REDUCE") && atoi(getenv("GGML_PASCAL_F16_REDUCE"));
+        constexpr size_t f16_reduce_min_bytes = 1u << 20; // keep decode and spec verify in F32
+        std::vector<ggml_tensor *> halves(n_backends, nullptr);
+
+        auto to_half = [&](const size_t j, const size_t i_buf) -> ggml_status {
+            auto & bcj = backend_ctx->backend_configs[j];
+            ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
+            GGML_ASSERT(ggml_is_contiguous(node));
+
+            ggml_tensor * half = get_node_aux(node);
+            half->type  = GGML_TYPE_F16;
+            half->nb[0] = ggml_type_size(GGML_TYPE_F16);
+            for (int k = 1; k < GGML_MAX_DIMS; k++) {
+                half->nb[k] = half->nb[k-1]*half->ne[k-1];
+            }
+            set_tmp_data(half, j, i_buf);
+
+            ggml_tensor * to16 = get_node_aux(half);
+            to16->op     = GGML_OP_CPY;
+            to16->src[0] = node;
+            to16->src[1] = half;
+            to16->view_src = half;
+            to16->data   = half->data;
+            to16->buffer = half->buffer;
+            to16->flags |= GGML_TENSOR_FLAG_COMPUTE;
+
+            ggml_tensor * to32 = get_node_aux(node);
+            to32->op     = GGML_OP_CPY;
+            to32->src[0] = half;
+            to32->src[1] = node;
+            to32->view_src  = node->view_src == nullptr ? node : node->view_src;
+            to32->view_offs = node->view_offs;
+            to32->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_backend_view_init(to32);
+
+            for (ggml_tensor * t : {to16, to32}) {
+                ggml_cgraph * g = get_cgraph_aux();
+                g->nodes[0] = t;
+                g->n_nodes  = 1;
+                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, g);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+            halves[j] = half;
+            return GGML_STATUS_SUCCESS;
+        };
+
         auto push_data = [&](const size_t j_src, const size_t j_dst, const size_t i_buf) {
             assert(step_cgraphs[j_dst] == nullptr);
             auto & bcj_src = backend_ctx->backend_configs[j_src];
@@ -2388,17 +2440,25 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
-            ggml_tensor * node_tmp = get_node_aux(node_dst);
+            ggml_tensor * half_src = halves[j_src];
+            ggml_tensor * node_tmp = get_node_aux(half_src ? half_src : node_dst);
             set_tmp_data(node_tmp, j_dst, i_buf);
+            if (half_src) {
+                // the sender's own half sits at offset 0 of the same buffer
+                node_tmp->data = (char *) node_tmp->data + GGML_PAD(ggml_nbytes(half_src), 256);
+                GGML_ASSERT((char *) node_tmp->data + ggml_nbytes(half_src) <=
+                    (char *) ggml_backend_buffer_get_base(node_tmp->buffer) + ggml_backend_buffer_get_size(node_tmp->buffer));
+            }
 
-            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, node_src, node_tmp);
+            ggml_backend_tensor_copy_async(bcj_src.backend, bcj_dst.backend, half_src ? half_src : node_src, node_tmp);
 
             ggml_tensor * node_red = get_node_aux(node_dst);
             node_red->view_src = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
             node_red->view_offs = node_dst->view_offs;
             node_red->op = GGML_OP_ADD;
-            node_red->src[0] = node_dst;
-            node_red->src[1] = node_tmp;
+            // CUDA ADD takes an F16 src0 with an F32 src1/dst, not the other way round
+            node_red->src[0] = half_src ? node_tmp : node_dst;
+            node_red->src[1] = half_src ? node_dst : node_tmp;
             node_red->flags |= GGML_TENSOR_FLAG_COMPUTE;
             ggml_backend_view_init(node_red);
 
@@ -2429,6 +2489,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // Butterfly reduction:
         for (; offset_j >= 1; offset_j /= 2) {
             std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
+            std::fill(halves.begin(), halves.end(), nullptr);
+
+            const ggml_tensor * node0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->nodes[
+                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main->n_nodes - 1];
+            if (f16_reduce && node0->type == GGML_TYPE_F32 && ggml_nbytes(node0) >= f16_reduce_min_bytes) {
+                for (size_t j = 0; j < 2*offset_j_max; j++) {
+                    if ((j ^ offset_j) >= n_backends) {
+                        continue;
+                    }
+                    const ggml_status status = to_half(j, i_buf);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                }
+            }
 
             for (size_t j = 0; j < 2*offset_j_max; j++) {
                 const size_t j_other = j ^ offset_j;

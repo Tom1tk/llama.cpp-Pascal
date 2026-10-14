@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvh.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1450,6 +1451,11 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    if (!ids && !fusion && ggml_cuda_mmvh_can_use(src0, src1, dst)) {
+        ggml_cuda_mul_mat_vec_h(ctx, src0, src1, dst);
+        return;
+    }
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;

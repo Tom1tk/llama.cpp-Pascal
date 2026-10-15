@@ -432,6 +432,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
     static const std::regex pattern_output_weight("output\\.weight");
+    static const std::regex pattern_nextn_head_weight("blk\\.\\d*\\.nextn\\.shared_head_head\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
@@ -601,7 +602,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
+        if (std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_nextn_head_weight)) {
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }

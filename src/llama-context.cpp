@@ -1010,6 +1010,22 @@ enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
 }
 
+// Pascal fork (H45): an MTP head may cover only a vocab prefix [K < n_vocab];
+// copy its rows and widen them in place, ids >= K get -inf so they are never sampled
+static void get_logits_rows(ggml_backend_t backend, const ggml_tensor * t, float * dst, int64_t n_rows, int64_t n_vocab) {
+    const int64_t k = t->ne[0];
+    GGML_ASSERT(k <= n_vocab);
+    ggml_backend_tensor_get_async(backend, t, dst, 0, n_rows*k*sizeof(float));
+    if (k == n_vocab) {
+        return;
+    }
+    ggml_backend_synchronize(backend);
+    for (int64_t r = n_rows - 1; r >= 0; --r) {
+        std::memmove(dst + r*n_vocab, dst + r*k, k*sizeof(float));
+        std::fill(dst + r*n_vocab + k, dst + (r + 1)*n_vocab, -INFINITY);
+    }
+}
+
 float * llama_context::get_logits() {
     output_reorder();
 
@@ -1669,8 +1685,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        GGML_ASSERT(t_logits->ne[0] == n_vocab && "trimmed LM head needs backend sampling");
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        get_logits_rows(backend_res, t_logits, logits.data, n_tokens, n_vocab);
     }
 
     // extract embeddings
@@ -2053,12 +2068,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             GGML_ASSERT(logits.data != nullptr);
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
-            GGML_ASSERT(t_logits->ne[0] == n_vocab && "trimmed LM head needs backend sampling");
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                get_logits_rows(backend_res, t_logits, logits_out, n_outputs, n_vocab);
             }
         }
 

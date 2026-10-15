@@ -30,7 +30,7 @@ static bool mmvh_q6k_wide_enabled() {
     return enabled;
 }
 
-// Q3_K, Q2_K and the IQ2 family on mmvh (otherwise mmvq), opt-in.
+// Q3_K, Q2_K, IQ4_NL and the IQ2 family on mmvh (otherwise mmvq), opt-in.
 static bool mmvh_lowbit_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_PASCAL_MMVH_LOWBIT");
@@ -65,6 +65,7 @@ bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, 
             break;
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_K:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_XXS:
@@ -229,17 +230,18 @@ struct mmvh_units4 {
 
 // 16 bytes at a 2-byte aligned address: 5 aligned 4-byte loads + funnel shifts, branch-free.
 // Reads up to 4 bytes past the end; every caller stays inside its block_q6_K.
+template <int n = 4>
 static __device__ __forceinline__ void mmvh_load16_b2(const uint8_t * p, int * out) {
     const uintptr_t a  = (uintptr_t) p;
     const int     * q  = (const int *) (a & ~uintptr_t(3));
     const int       sh = (a & 2) * 8;
-    int w[5];
+    int w[n + 1];
 #pragma unroll
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < n + 1; ++i) {
         w[i] = q[i];
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < n; ++i) {
         out[i] = __funnelshift_r(w[i], w[i + 1], sh);
     }
 }
@@ -353,6 +355,29 @@ __device__ __forceinline__ void mmvh_load<GGML_TYPE_IQ4_XS>(const char * __restr
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         u.blk[k] = ib;
+        u.hf[k]  = k;
+        u.ws[k]  = d;
+        u.mt[k]  = 128.0f * d;
+    }
+}
+
+// IQ4_NL: 32-weight blocks, eight of them per "superblock" here (ne00 % 256 == 0 is checked).
+template <>
+__device__ __forceinline__ void mmvh_load<GGML_TYPE_IQ4_NL>(const char * __restrict__ row, const int sb, const int sub, mmvh_units & u) {
+    const block_iq4_nl * bq = (const block_iq4_nl *) row + (QK_K/QK4_NL)*sb + sub;
+    // block_iq4_nl is 18 bytes: only 2-byte alignment
+    int q[4];
+    mmvh_load16_b2(bq->qs, q);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int2 v = mmvh_iq4nl_lookup(q[i]);
+        u.b[0][i] = v.x;
+        u.b[1][i] = v.y;
+    }
+    const float d = __half2float(bq->d);
+#pragma unroll
+    for (int k = 0; k < 2; ++k) {
+        u.blk[k] = sub;
         u.hf[k]  = k;
         u.ws[k]  = d;
         u.mt[k]  = 128.0f * d;
@@ -657,6 +682,9 @@ void ggml_cuda_mul_mat_vec_h(ggml_backend_cuda_context & ctx,
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_h_cuda<GGML_TYPE_IQ4_XS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ4_NL>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ3_S:
             mul_mat_vec_h_cuda<GGML_TYPE_IQ3_S>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);

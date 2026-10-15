@@ -18,6 +18,12 @@ static bool ggml_cuda_fattn_pascal_gemm_enabled() {
     return on;
 }
 
+// H47: Q*K as an HGEMM (fp16 compute, S in f16). Q is pre-multiplied by the softmax scale so |S| stays small.
+static bool ggml_cuda_fattn_pascal_gemm_qk16() {
+    static const bool on = getenv("GGML_PASCAL_FA_GEMM_QK16") && atoi(getenv("GGML_PASCAL_FA_GEMM_QK16"));
+    return on;
+}
+
 static bool ggml_cuda_fattn_pascal_gemm_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -38,19 +44,19 @@ static bool ggml_cuda_fattn_pascal_gemm_supported(const ggml_tensor * dst) {
 
 // Q [D, n_q, H] f32 (strided) -> Qh [D, n_q, H] f16 contiguous
 static __global__ void k_fattn_pg_q_f16(const char * Q, half * Qh, const int D, const int n_q,
-        const size_t nb1, const size_t nb2) {
+        const size_t nb1, const size_t nb2, const float qscale) {
     const int j = blockIdx.x, h = blockIdx.y;
     const float * q = (const float *) (Q + j*nb1 + h*nb2);
     half * o = Qh + (size_t) D*(j + (size_t) n_q*h);
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
-        o[d] = __float2half(q[d]);
+        o[d] = __float2half(q[d]*qscale);
     }
 }
 
 // One block per query j, looping over the H heads so the mask row is read once.
 // S/P column for (h, j) is h*n_q + j with leading dimension C.
-template <int C>
-static __global__ void k_fattn_pg_softmax(const float * S, half * P, const half * mask, const size_t mask_nb1,
+template <int C, typename TS>
+static __global__ void k_fattn_pg_softmax(const TS * S, half * P, const half * mask, const size_t mask_nb1,
         float * m, float * l, float * alpha, const int Cc, const int kv0, const int n_q, const int H,
         const float scale, const bool first) {
     constexpr int nt = 256, npt = C/nt;
@@ -65,13 +71,13 @@ static __global__ void k_fattn_pg_softmax(const float * S, half * P, const half 
     __shared__ float red[nt/WARP_SIZE];
     for (int h = 0; h < H; ++h) {
         const size_t col = (size_t) h*n_q + j;
-        const float * s_col = S + col*C;
+        const TS * s_col = S + col*C;
         float sv[npt];
         float smax = -INFINITY;
 #pragma unroll
         for (int k = 0; k < npt; ++k) {
             const int i = threadIdx.x + k*nt;
-            sv[k] = i < Cc ? s_col[i]*scale + mv[k] : -INFINITY;
+            sv[k] = i < Cc ? ggml_cuda_cast<float>(s_col[i])*scale + mv[k] : -INFINITY;
             smax = fmaxf(smax, sv[k]);
         }
         smax = warp_reduce_max(smax);
@@ -180,14 +186,17 @@ static void ggml_cuda_flash_attn_ext_pascal_gemm(ggml_backend_cuda_context & ctx
 
     ggml_cuda_pool & pool = ctx.pool();
     ggml_cuda_pool_alloc<half>  Qh(pool, (size_t) D*cols);
-    ggml_cuda_pool_alloc<float> S (pool, (size_t) C*cols);
+    const bool qk16 = ggml_cuda_fattn_pascal_gemm_qk16();
+    ggml_cuda_pool_alloc<char>  S (pool, (size_t) C*cols*(qk16 ? sizeof(half) : sizeof(float)));
     ggml_cuda_pool_alloc<half>  P (pool, (size_t) C*cols);
     ggml_cuda_pool_alloc<half>  Oc(pool, (size_t) D*cols);
     ggml_cuda_pool_alloc<float> O (pool, (size_t) D*cols);
     ggml_cuda_pool_alloc<float> ml(pool, 3*cols);
     float * m = ml.ptr, * l = ml.ptr + cols, * alpha = ml.ptr + 2*cols;
 
-    k_fattn_pg_q_f16<<<dim3(n_q, H), 256, 0, stream>>>((const char *) Q->data, Qh.ptr, D, n_q, Q->nb[1], Q->nb[2]);
+    k_fattn_pg_q_f16<<<dim3(n_q, H), 256, 0, stream>>>((const char *) Q->data, Qh.ptr, D, n_q, Q->nb[1], Q->nb[2],
+        qk16 ? scale : 1.0f);
+    const float sm_scale = qk16 ? 1.0f : scale;
 
     cublasHandle_t handle = ctx.cublas_handle();
     CUBLAS_CHECK(cublasSetStream(handle, stream));
@@ -199,17 +208,21 @@ static void ggml_cuda_flash_attn_ext_pascal_gemm(ggml_backend_cuda_context & ctx
         const bool first = kv0 == 0, last = kv0 + C >= n_kv;
 
         // S[Cc x cols_g] = K^T Q per kv head
-        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, Cc, cols_g, D, &one,
+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, Cc, cols_g, D, qk16 ? (const void *) &h1 : &one,
             K_h + kv0*nb11, CUDA_R_16F, nb11/sizeof(half), nb12/sizeof(half),
-            Qh.ptr, CUDA_R_16F, D, (long long) D*cols_g, &zero,
-            S.ptr, CUDA_R_32F, C, (long long) C*cols_g, Hkv, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            Qh.ptr, CUDA_R_16F, D, (long long) D*cols_g, qk16 ? (const void *) &h0 : &zero,
+            S.ptr, qk16 ? CUDA_R_16F : CUDA_R_32F, C, (long long) C*cols_g, Hkv,
+            qk16 ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 
-        if (wide) {
-            k_fattn_pg_softmax<4096><<<n_q, 256, 0, stream>>>(S.ptr, P.ptr, (const half *) mask->data, mask->nb[1],
-                m, l, alpha, Cc, kv0, n_q, H, scale, first);
+        const half * mk = (const half *) mask->data;
+        if (qk16) {
+            const half * Sh = (const half *) S.ptr;
+            if (wide) k_fattn_pg_softmax<4096><<<n_q, 256, 0, stream>>>(Sh, P.ptr, mk, mask->nb[1], m, l, alpha, Cc, kv0, n_q, H, sm_scale, first);
+            else      k_fattn_pg_softmax<2048><<<n_q, 256, 0, stream>>>(Sh, P.ptr, mk, mask->nb[1], m, l, alpha, Cc, kv0, n_q, H, sm_scale, first);
         } else {
-            k_fattn_pg_softmax<2048><<<n_q, 256, 0, stream>>>(S.ptr, P.ptr, (const half *) mask->data, mask->nb[1],
-                m, l, alpha, Cc, kv0, n_q, H, scale, first);
+            const float * Sf = (const float *) S.ptr;
+            if (wide) k_fattn_pg_softmax<4096><<<n_q, 256, 0, stream>>>(Sf, P.ptr, mk, mask->nb[1], m, l, alpha, Cc, kv0, n_q, H, sm_scale, first);
+            else      k_fattn_pg_softmax<2048><<<n_q, 256, 0, stream>>>(Sf, P.ptr, mk, mask->nb[1], m, l, alpha, Cc, kv0, n_q, H, sm_scale, first);
         }
 
         // Oc[D x cols_g] = V P per kv head

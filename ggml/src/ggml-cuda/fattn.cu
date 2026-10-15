@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-pascal-gemm.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -760,6 +761,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+            if (ggml_cuda_fattn_pascal_gemm_supported(dst)) {
+                ggml_cuda_flash_attn_ext_pascal_gemm(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:

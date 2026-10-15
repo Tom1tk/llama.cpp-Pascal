@@ -127,6 +127,18 @@ struct mmvh_units {
 template <ggml_type type>
 static __device__ __forceinline__ void mmvh_load(const char * __restrict__ row, const int sb, const int sub, mmvh_units & u);
 
+// Q4_K / Q5_K 6-bit scale and min for 32-block is, branch-free (is < 4 vs >= 4 diverges across lanes).
+// scales[] sits at offset 4 of both blocks, so it is 4-byte aligned.
+static __device__ __forceinline__ void mmvh_scale_min_k4(const uint8_t * scales, const int is, int & sc, int & m) {
+    const int * s4 = (const int *) scales;
+    const int sh = 8*(is & 3);
+    const int b0 = (s4[0] >> sh) & 0xFF;
+    const int b1 = (s4[1] >> sh) & 0xFF;
+    const int b2 = (s4[2] >> sh) & 0xFF;
+    sc = is < 4 ? b0 & 63 : (b2 & 0xF) | ((b0 >> 6) << 4);
+    m  = is < 4 ? b1 & 63 : (b2 >>  4) | ((b1 >> 6) << 4);
+}
+
 template <>
 __device__ __forceinline__ void mmvh_load<GGML_TYPE_Q4_K>(const char * __restrict__ row, const int sb, const int sub, mmvh_units & u) {
     const block_q4_K * bq = (const block_q4_K *) row + sb;
@@ -143,13 +155,8 @@ __device__ __forceinline__ void mmvh_load<GGML_TYPE_Q4_K>(const char * __restric
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         const int is = 2*j + k;
-        uint8_t sc, m;
-        if (is < 4) {
-            sc = bq->scales[is] & 63; m = bq->scales[is + 4] & 63;
-        } else {
-            sc = (bq->scales[is + 4] & 0xF) | ((bq->scales[is - 4] >> 6) << 4);
-            m  = (bq->scales[is + 4] >>  4) | ((bq->scales[is - 0] >> 6) << 4);
-        }
+        int sc, m;
+        mmvh_scale_min_k4(bq->scales, is, sc, m);
         u.blk[k] = is;
         u.hf[k]  = sub & 1;
         u.ws[k]  = dm.x * sc;
@@ -175,13 +182,8 @@ __device__ __forceinline__ void mmvh_load<GGML_TYPE_Q5_K>(const char * __restric
 #pragma unroll
     for (int k = 0; k < 2; ++k) {
         const int is = 2*j + k;
-        uint8_t sc, m;
-        if (is < 4) {
-            sc = bq->scales[is] & 63; m = bq->scales[is + 4] & 63;
-        } else {
-            sc = (bq->scales[is + 4] & 0xF) | ((bq->scales[is - 4] >> 6) << 4);
-            m  = (bq->scales[is + 4] >>  4) | ((bq->scales[is - 0] >> 6) << 4);
-        }
+        int sc, m;
+        mmvh_scale_min_k4(bq->scales, is, sc, m);
         u.blk[k] = is;
         u.hf[k]  = sub & 1;
         u.ws[k]  = dm.x * sc;

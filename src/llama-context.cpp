@@ -1669,6 +1669,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
+        GGML_ASSERT(t_logits->ne[0] == n_vocab && "trimmed LM head needs backend sampling");
         ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
     }
 
@@ -2052,6 +2053,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             GGML_ASSERT(logits.data != nullptr);
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            GGML_ASSERT(t_logits->ne[0] == n_vocab && "trimmed LM head needs backend sampling");
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);

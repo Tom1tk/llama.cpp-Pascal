@@ -12318,10 +12318,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // ... and decode (H50): nb 1 = plain step, nb 4 = MTP verify (1 + 3 drafts), at 16k and 98k.
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (int64_t kv : {16384, 98304}) {
-            for (int64_t nb : {1, 4}) {
+            for (int64_t nb : {1, 4, 5}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
         }
+    }
+    // ... and H55: per-card matmuls at the MTP verify batch, 4 (n=3 drafts) vs 5 (n=4) columns.
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{8704, 5120}, {5120, 8704}, {5120, 3072}, {5120, 5120}}) {
+            for (int64_t n : {4, 5}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
+            }
+        }
+    }
+    for (int64_t n : {4, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 124160, n, 5120, {1, 1}, {1, 1}));
     }
 
     // Pascal fork D2: Qwen3.8-27B decode matvec per card under -sm tensor (FFN gate/up, FFN down, ssm_out).

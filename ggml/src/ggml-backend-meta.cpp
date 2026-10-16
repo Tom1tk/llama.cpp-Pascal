@@ -2380,9 +2380,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
         std::fill(step_cgraphs.begin(), step_cgraphs.end(), nullptr);
 
-        // GGML_PASCAL_F16_REDUCE=1: large (prefill) partials cross PCIe as F16, half the bytes.
-        // Each card rounds its own partial to F16 too, so both cards end with identical sums.
-        static const bool f16_reduce = getenv("GGML_PASCAL_F16_REDUCE") && atoi(getenv("GGML_PASCAL_F16_REDUCE"));
+        // GGML_PASCAL_F16_REDUCE (on by default in this fork, =0 turns it off): large (prefill) partials cross
+        // PCIe as F16, half the bytes. Each card rounds its own partial to F16 too, so both cards end with
+        // identical sums. Backend-agnostic code, so unlike the CUDA levers it does not check for sm_60.
+        static const bool f16_reduce = !getenv("GGML_PASCAL_F16_REDUCE") || atoi(getenv("GGML_PASCAL_F16_REDUCE"));
         constexpr size_t f16_reduce_min_bytes = 1u << 20; // keep decode and spec verify in F32
         std::vector<ggml_tensor *> halves(n_backends, nullptr);
 

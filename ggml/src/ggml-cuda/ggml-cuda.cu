@@ -1598,11 +1598,11 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ldc));
     } else if (ne12 == 1 && ne13 == 1) {
-        // GGML_CUDA_PASCAL_GEMM_ALGO=1: on sm_60 cuBLAS's default HGEMM pick runs at 5-7 TFLOPS for
+        // GGML_CUDA_PASCAL_GEMM_ALGO (on by default on sm_60): on sm_60 cuBLAS's default HGEMM pick runs at 5-7 TFLOPS for
         // n = 512-1024 at Qwen3.8-27B shapes; ALGO3 holds 12-17 TFLOPS from n = 512 up, but is 2-3x
         // slower below n = 256 (bench H33).
-        static const bool pascal_gemm_algo = getenv("GGML_CUDA_PASCAL_GEMM_ALGO") && atoi(getenv("GGML_CUDA_PASCAL_GEMM_ALGO"));
-        const cublasGemmAlgo_t algo = pascal_gemm_algo && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA &&
+        static const int pascal_gemm_algo = ggml_cuda_pascal_env("GGML_CUDA_PASCAL_GEMM_ALGO");
+        const cublasGemmAlgo_t algo = ggml_cuda_pascal_lever(pascal_gemm_algo, cc) && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA &&
             cu_compute_type == CUBLAS_COMPUTE_16F && ne11 >= 512 ? CUBLAS_GEMM_ALGO3 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
         CUBLAS_CHECK(
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
@@ -2684,12 +2684,12 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, cuda_ctx_src->stream()));
 
         // wait on dst stream for the copy to complete
-        // GGML_PASCAL_DUPLEX_REDUCE=1: defer the wait to dst's next graph/sync/transfer, so dst can still
+        // GGML_PASCAL_DUPLEX_REDUCE (on by default on sm_60): defer the wait to dst's next graph/sync/transfer, so dst can still
         // enqueue its own copy back to src first and the two directions of an AllReduce pair overlap
         // (full-duplex PCIe) instead of serialising. Assumes dst does not forward the received buffer
         // through cpy_tensor_async before computing on it (true for the meta-backend butterfly).
-        static const bool duplex = getenv("GGML_PASCAL_DUPLEX_REDUCE") && atoi(getenv("GGML_PASCAL_DUPLEX_REDUCE"));
-        if (duplex && src_physical != dst_physical) {
+        static const int duplex = ggml_cuda_pascal_env("GGML_PASCAL_DUPLEX_REDUCE");
+        if (ggml_cuda_pascal_lever(duplex, ggml_cuda_info().devices[cuda_ctx_dst->device].cc) && src_physical != dst_physical) {
             ggml_cuda_apply_deferred_wait(cuda_ctx_dst);
             cuda_ctx_dst->deferred_wait = cuda_ctx_src->copy_event;
         } else {

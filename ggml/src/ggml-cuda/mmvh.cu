@@ -21,38 +21,22 @@
 
 #define MMVH_NWARPS 4
 
-// H41: Q6_K with 4 lanes per superblock (64 weights each) instead of 8, opt-in.
-static bool mmvh_q6k_wide_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_PASCAL_MMVH_Q6K_WIDE");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
+// Every lever below is on by default on sm_60 (ggml_cuda_pascal_lever).
+// GGML_CUDA_PASCAL_MMVH: mmvh itself. GGML_PASCAL_MMVH_LOWBIT: Q3_K, Q2_K, IQ4_NL and the IQ2 family
+// on mmvh (otherwise mmvq). GGML_PASCAL_MMVH_Q6K_WIDE (H41): Q6_K with 4 lanes per superblock instead of 8.
+static bool mmvh_lever(const int lever, const int cc) {
+    static const int env[3] = {
+        ggml_cuda_pascal_env("GGML_CUDA_PASCAL_MMVH"),
+        ggml_cuda_pascal_env("GGML_PASCAL_MMVH_LOWBIT"),
+        ggml_cuda_pascal_env("GGML_PASCAL_MMVH_Q6K_WIDE"),
+    };
+    return ggml_cuda_pascal_lever(env[lever], cc);
 }
-
-// Q3_K, Q2_K, IQ4_NL and the IQ2 family on mmvh (otherwise mmvq), opt-in.
-static bool mmvh_lowbit_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_PASCAL_MMVH_LOWBIT");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
-static bool mmvh_env_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_CUDA_PASCAL_MMVH");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
+enum { MMVH_ON, MMVH_LOWBIT, MMVH_Q6K_WIDE };
 
 bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
-    if (!mmvh_env_enabled()) {
-        return false;
-    }
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL || cc >= GGML_CUDA_CC_VOLTA) {
+    if (!mmvh_lever(MMVH_ON, cc) || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_PASCAL || cc >= GGML_CUDA_CC_VOLTA) {
         return false;
     }
     switch (src0->type) {
@@ -69,7 +53,7 @@ bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, 
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_XXS:
-            if (!mmvh_lowbit_enabled()) {
+            if (!mmvh_lever(MMVH_LOWBIT, cc)) {
                 return false;
             }
             break;
@@ -674,7 +658,7 @@ void ggml_cuda_mul_mat_vec_h(ggml_backend_cuda_context & ctx,
             mul_mat_vec_h_cuda<GGML_TYPE_Q5_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_Q6_K:
-            if (mmvh_q6k_wide_enabled()) {
+            if (mmvh_lever(MMVH_Q6K_WIDE, ggml_cuda_info().devices[ctx.device].cc)) {
                 mul_mat_vec_h_cuda<GGML_TYPE_Q6_K, 4>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             } else {
                 mul_mat_vec_h_cuda<GGML_TYPE_Q6_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);

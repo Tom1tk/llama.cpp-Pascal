@@ -1,4 +1,4 @@
-// Pascal fork (H46): prefill flash attention through cuBLAS, GGML_PASCAL_FA_GEMM=1.
+// Pascal fork (H46): prefill flash attention through cuBLAS, GGML_PASCAL_FA_GEMM (on by default on sm_60).
 // sm_60 has no tensor cores; the tile kernel reaches ~5.5 TFLOPS on D=256 prefill,
 // while cuBLAS reaches ~7.6 (Q*K, fp32 accumulate) and ~14.5 (P*V, HGEMM) on the same shapes.
 // Per KV chunk of C tokens: S = K^T Q (f32), online softmax -> P (f16), O_c = V P (f16),
@@ -14,8 +14,8 @@
 #include <cstdlib>
 
 static bool ggml_cuda_fattn_pascal_gemm_enabled() {
-    static const bool on = getenv("GGML_PASCAL_FA_GEMM") && atoi(getenv("GGML_PASCAL_FA_GEMM"));
-    return on;
+    static const int env = ggml_cuda_pascal_env("GGML_PASCAL_FA_GEMM");
+    return ggml_cuda_pascal_lever(env, ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
 }
 
 static bool ggml_cuda_fattn_pascal_gemm_supported(const ggml_tensor * dst) {

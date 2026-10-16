@@ -319,6 +319,17 @@ static bool fp16_available(const int cc) {
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_PH1);
 }
 
+// Pascal fork levers: -1 if NAME is unset, else 0/1. Unset levers are on for the P100 (sm_60) only;
+// NAME=0 turns one off, NAME=1 forces it on for other Pascal cards.
+static int ggml_cuda_pascal_env(const char * name) {
+    const char * env = getenv(name);
+    return env != nullptr ? atoi(env) != 0 : -1;
+}
+
+static bool ggml_cuda_pascal_lever(const int env, const int cc) {
+    return env >= 0 ? env != 0 : cc == GGML_CUDA_CC_PASCAL;
+}
+
 static bool fast_fp16_available(const int cc) {
     return GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_NVIDIA(cc) && fp16_available(cc) && ggml_cuda_highest_compiled_arch(cc) != 610 &&

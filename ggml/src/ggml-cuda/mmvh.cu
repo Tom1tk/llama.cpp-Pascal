@@ -39,15 +39,6 @@ static bool mmvh_lowbit_enabled() {
     return enabled;
 }
 
-// H55: keep 4 rows per warp at 5-8 columns (MTP verify with 4+ drafts) instead of 2, opt-in.
-static bool mmvh_r4_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_PASCAL_MMVH_R4");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
 static bool mmvh_env_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_PASCAL_MMVH");
@@ -631,15 +622,10 @@ static __global__ void mul_mat_vec_h(const char * __restrict__ vx, const half * 
     }
 }
 
-template <ggml_type type, int ncols, int NU, int R = (ncols <= 4 ? 4 : 2)>
+template <ggml_type type, int ncols, int NU>
 static void mul_mat_vec_h_launch(const char * vx, const half * xh, const float4 * meta, float * dst, const int nsb,
         const int64_t nrows, const int64_t stride_row_x, const int64_t ncols_padded, const int64_t stride_col_dst, cudaStream_t stream) {
-    if constexpr (R == 2) {
-        if (mmvh_r4_enabled()) {
-            mul_mat_vec_h_launch<type, ncols, NU, 4>(vx, xh, meta, dst, nsb, nrows, stride_row_x, ncols_padded, stride_col_dst, stream);
-            return;
-        }
-    }
+    constexpr int R = ncols <= 4 ? 4 : 2;
     const dim3 grid((nrows + MMVH_NWARPS*R - 1) / (MMVH_NWARPS*R));
     const dim3 block(WARP_SIZE, MMVH_NWARPS);
     mul_mat_vec_h<type, ncols, R, NU><<<grid, block, 0, stream>>>(vx, xh, meta, dst, nsb, nrows, stride_row_x, ncols_padded, stride_col_dst);

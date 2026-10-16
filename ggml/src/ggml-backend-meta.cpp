@@ -6,20 +6,15 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
-#include <mutex>
 #include <memory>
 #include <set>
 #include <string>
-#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -1808,70 +1803,6 @@ static ggml_guid_t ggml_backend_meta_guid() {
     return &guid;
 }
 
-// Pascal fork D-new: GGML_PASCAL_PAR_DISPATCH=1. The meta backend launches every subgraph from one host
-// thread, backend after backend. In 2-card decode the host spends ~9 us per kernel launch against ~20 us
-// of GPU time per kernel, so backend 1 always starts behind and backend 0 idles at the reduce. A worker
-// thread per extra backend issues that backend's subgraph while the main thread issues backend 0's.
-// Reduces stay on the main thread. Workers spin ~1 ms for the next task, then sleep.
-struct ggml_backend_meta_dispatch_worker {
-    ggml_backend_t        backend = nullptr;
-    ggml_cgraph *         cgraph  = nullptr;
-    ggml_status           status  = GGML_STATUS_SUCCESS;
-    std::atomic<uint64_t> posted{0};
-    std::atomic<uint64_t> done{0};
-    std::atomic<bool>     stop{false};
-    std::mutex              mutex;
-    std::condition_variable cv;
-    std::thread             thread;
-
-    ggml_backend_meta_dispatch_worker() : thread([this] { run(); }) {}
-
-    ~ggml_backend_meta_dispatch_worker() {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            stop = true;
-        }
-        cv.notify_one();
-        thread.join();
-    }
-
-    void run() {
-        uint64_t seen = 0;
-        while (true) {
-            auto t0 = std::chrono::steady_clock::now();
-            for (uint32_t k = 1; posted.load(std::memory_order_acquire) == seen && !stop; k++) {
-                if (k % 1024 == 0 && std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(1)) {
-                    std::unique_lock<std::mutex> lock(mutex);
-                    cv.wait(lock, [&] { return posted.load(std::memory_order_acquire) != seen || stop; });
-                }
-            }
-            if (stop) {
-                return;
-            }
-            seen   = posted.load(std::memory_order_acquire);
-            status = ggml_backend_graph_compute_async(backend, cgraph);
-            done.store(seen, std::memory_order_release);
-        }
-    }
-
-    void post(ggml_backend_t b, ggml_cgraph * g) {
-        backend = b;
-        cgraph  = g;
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            posted.fetch_add(1, std::memory_order_release);
-        }
-        cv.notify_one();
-    }
-
-    ggml_status wait() {
-        const uint64_t target = posted.load(std::memory_order_relaxed);
-        while (done.load(std::memory_order_acquire) != target) {
-        }
-        return status;
-    }
-};
-
 struct ggml_backend_meta_context {
     struct cgraph_config {
         ggml_cgraph * cgraph_main = nullptr;
@@ -1904,8 +1835,6 @@ struct ggml_backend_meta_context {
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
-
-    std::vector<std::unique_ptr<ggml_backend_meta_dispatch_worker>> dispatch_workers; // backends 1..n-1
 
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -1941,7 +1870,6 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
-        dispatch_workers.clear();
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2613,35 +2541,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    static const bool par_dispatch = getenv("GGML_PASCAL_PAR_DISPATCH") && atoi(getenv("GGML_PASCAL_PAR_DISPATCH"));
-    auto & workers = backend_ctx->dispatch_workers;
-    if (par_dispatch && n_backends > 1 && workers.empty()) {
-        for (size_t j = 1; j < n_backends; j++) {
-            workers.emplace_back(new ggml_backend_meta_dispatch_worker());
-        }
-    }
-
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        if (!workers.empty()) {
-            for (size_t j = 1; j < n_backends; j++) {
-                workers[j - 1]->post(backend_ctx->backend_configs[j].backend, backend_ctx->backend_configs[j].cgraphs[i].cgraph_main);
-            }
-            ggml_status status = ggml_backend_graph_compute_async(backend_ctx->backend_configs[0].backend,
-                backend_ctx->backend_configs[0].cgraphs[i].cgraph_main);
-            for (auto & w : workers) {
-                const ggml_status status_j = w->wait();
-                status = status == GGML_STATUS_SUCCESS ? status_j : status;
-            }
+        for (size_t j = 0; j < n_backends; j++) {
+            auto & bcj = backend_ctx->backend_configs[j];
+            const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
-            }
-        } else {
-            for (size_t j = 0; j < n_backends; j++) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
             }
         }
 

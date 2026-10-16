@@ -18,11 +18,6 @@
         return ((nthreads) << 0) | ((occupancy) << 10) | ((nbatch_fa) << 14) | ((nbatch_K) << 23);    \
     }                                                                                                 \
 
-#if __has_include("pascal-p5-sweep.h") // P5 sweep only (build-logs/p5-fa-sweep.sh), never committed
-#include "pascal-p5-sweep.h"
-#endif
-#define GGML_PASCAL_FATTN_TILE_CONFIG_CASE_X(...) GGML_CUDA_FATTN_TILE_CONFIG_CASE(__VA_ARGS__)
-
 static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nvidia_fp16(const int DKQ, const int DV, const int ncols) {
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  2, 128, 3, 128,  40)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE( 40,  40,  4, 128, 2, 128,  40)
@@ -74,15 +69,9 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64) // H54 GQA 6, nb 1
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  64,  64) // H54 GQA 6, nb 2-4
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  64,  64)
-#ifdef GGML_PASCAL_FA256_32 // Pascal fork P5 sweep: "nthreads, occupancy, nbatch_fa, nbatch_K"
-    GGML_PASCAL_FATTN_TILE_CONFIG_CASE_X(256, 256, 32, GGML_PASCAL_FA256_32)
-#else
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  64,  64)
-#endif // GGML_PASCAL_FA256_32
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  64,  64)
 
@@ -149,8 +138,6 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 128, 3,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 3,  32,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  32,  64) // H54 GQA 6, nb 1
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  32,  64) // H54 GQA 6, nb 2-4
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32,  64)
@@ -1246,27 +1233,6 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     GGML_ABORT("fatal error");
 }
 
-// H54: GQA 6 (Qwen3.8-27B) packed into one block per K/V head for decode, so K/V are read once instead of 3x
-// through the GQA-2 path. nb 1 -> 6 columns, nb 2-4 -> 24. Opt-in.
-static bool fattn_tile_gqa6_enabled() {
-    static const bool enabled = [] {
-        const char * env = getenv("GGML_PASCAL_FA_GQA6");
-        return env != nullptr && atoi(env) != 0;
-    }();
-    return enabled;
-}
-
-template <int DKQ, int DV, int ncols1, bool use_logit_softcap>
-static void launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    constexpr int ncols2    = 6;
-    constexpr int warp_size = 32;
-    const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2, cc) / warp_size;
-    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
-    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap>;
-    launch_fattn<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, true, true, false, false, warp_size);
-}
-
 template <int DKQ, int DV, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
@@ -1328,19 +1294,6 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
         }
         GGML_ABORT("flash-attn tile (192/128): expected GQA ratio multiple of 8");
     }
-
-#ifndef GGML_USE_HIP
-    if constexpr (DKQ == 256 && DV == 256) {
-        if (fattn_tile_gqa6_enabled() && use_gqa_opt && gqa_ratio % 6 == 0 && Q->ne[1] <= 4) {
-            if (Q->ne[1] == 1) {
-                launch_fattn_tile_gqa6<DKQ, DV, 1, use_logit_softcap>(ctx, dst);
-            } else {
-                launch_fattn_tile_gqa6<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
-            }
-            return;
-        }
-    }
-#endif // GGML_USE_HIP
 
     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {

@@ -11147,13 +11147,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
 
-    // Pascal fork H54: GQA 6 decode (GGML_PASCAL_FA_GQA6), D256 f16, nb 1-5 (5 falls back to GQA 2)
-    for (int64_t nb : {1, 2, 3, 4, 5}) {
-        for (int64_t kv : {512, 1024}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-        }
-    }
-
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -12325,27 +12318,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // ... and decode (H50): nb 1 = plain step, nb 4 = MTP verify (1 + 3 drafts), at 16k and 98k.
     for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
         for (int64_t kv : {16384, 98304}) {
-            for (int64_t nb : {1, 4, 5}) {
+            for (int64_t nb : {1, 4}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
         }
-    }
-    // ... and H54: GQA packing probe at 98k f16 (the tile kernel packs only power-of-2 head groups; Qwen is GQA 6).
-    for (int64_t nr2 : {2, 4, 8}) {
-        for (int64_t nb : {1, 4}) {
-            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, 98304, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-        }
-    }
-    // ... and H55: per-card matmuls at the MTP verify batch, 4 (n=3 drafts) vs 5 (n=4) columns.
-    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
-        for (auto mk : std::vector<std::pair<int64_t, int64_t>>{{8704, 5120}, {5120, 8704}, {5120, 3072}, {5120, 5120}}) {
-            for (int64_t n : {4, 5}) {
-                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, mk.first, n, mk.second, {1, 1}, {1, 1}));
-            }
-        }
-    }
-    for (int64_t n : {4, 5}) {
-        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 124160, n, 5120, {1, 1}, {1, 1}));
     }
 
     // Pascal fork D2: Qwen3.8-27B decode matvec per card under -sm tensor (FFN gate/up, FFN down, ssm_out).

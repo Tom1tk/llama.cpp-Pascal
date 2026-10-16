@@ -1135,14 +1135,6 @@ static bool ggml_backend_cuda_comm_allreduce_internal(
         return true;
     }
 
-    // GGML_PASCAL_AR_INTERNAL_MAX_BYTES: only reductions up to this size (decode, spec verify) take
-    // the internal path; larger ones fall back to the meta butterfly (P2P, F16, duplex) for prefill.
-    static const size_t max_bytes = getenv("GGML_PASCAL_AR_INTERNAL_MAX_BYTES") ?
-        strtoull(getenv("GGML_PASCAL_AR_INTERNAL_MAX_BYTES"), nullptr, 10) : SIZE_MAX;
-    if (ggml_nbytes(tensors[0]) > max_bytes) {
-        return false;
-    }
-
     for (size_t i = 0; i < n_backends; ++i) {
         if (tensors[i] == nullptr) {
             GGML_LOG_ERROR("%s: internal failed: tensor[%zu] is null\n", __func__, i);
@@ -2727,12 +2719,6 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_debug_enabled() {
     static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_GRAPH_DEBUG");
-    return enabled;
-}
-
-// Pascal fork (D1): opt back into CUDA graphs on cc < Volta; upstream's gate was a perf call, not correctness.
-static bool ggml_cuda_pascal_graphs_enabled() {
-    static const bool enabled = ggml_cuda_env_flag("GGML_CUDA_PASCAL_GRAPHS");
     return enabled;
 }
 
@@ -4715,7 +4701,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA && !ggml_cuda_pascal_graphs_enabled()) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }

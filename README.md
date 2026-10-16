@@ -1,5 +1,7 @@
 # llama.cpp
 
+> **This is llama.cpp-Pascal, a fork tuned for the Tesla P100 (sm_60).** What it changes, how to build and serve, and the benchmarks: [docs/pascal/README.md](docs/pascal/README.md). The rest of this README is upstream's.
+
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
 <div align="center">

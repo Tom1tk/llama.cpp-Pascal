@@ -11130,6 +11130,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                   256, 16, 16, {1, 1}, {nr2, 1}));
     }
 
+    // Pascal fork H54: GQA 6 decode (GGML_PASCAL_FA_GQA6), D256 f16, nb 1-5 (5 falls back to GQA 2)
+    for (int64_t nb : {1, 2, 3, 4, 5}) {
+        for (int64_t kv : {512, 1024}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+
     // add_id
     for (ggml_type type_a : {GGML_TYPE_F32}) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
@@ -12281,6 +12288,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (int64_t nb : {1, 4, 5}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
+        }
+    }
+    // ... and H54: GQA packing probe at 98k f16 (the tile kernel packs only power-of-2 head groups; Qwen is GQA 6).
+    for (int64_t nr2 : {2, 4, 8}) {
+        for (int64_t nb : {1, 4}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, 98304, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
     // ... and H55: per-card matmuls at the MTP verify batch, 4 (n=3 drafts) vs 5 (n=4) columns.

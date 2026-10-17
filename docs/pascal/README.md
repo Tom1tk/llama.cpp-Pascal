@@ -21,6 +21,9 @@ Design notes and per-lever results are in [fork-plan-2026-10-14.md](fork-plan-20
 
 100k needle-in-a-haystack: 19/19. The Q5_K_M FP32 reference gets 18/19.
 
+Real task: a 3-stage agentic web build with opencode v2 takes 35.6 min end to end,
+cold load included (bench Phase 5).
+
 ## Build
 
 ```

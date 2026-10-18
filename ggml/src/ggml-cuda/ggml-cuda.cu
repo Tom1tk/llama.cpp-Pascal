@@ -1180,9 +1180,91 @@ static bool ggml_backend_cuda_comm_try_allreduce_internal(
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
+// GGML_PASCAL_AR_P2P (on by default on sm_60): 2-card AllReduce of a decode-sized f32 tensor in one kernel per
+// card over direct peer loads/stores (port of Kmic-68's k_ar_p2p_f32, after ik_llama.cpp's reduce.cu). Card j
+// sums half j of both partials and writes the sum into both tensors: no peer memcpy, no ADD node, so two
+// launches instead of two copies, two waits and two ADDs. Larger exchanges (prefill) keep the meta-backend
+// butterfly with the f16 wire and duplex copies. Needs GGML_CUDA_P2P (peer access).
+static __global__ void k_ar_p2p_f32(float * __restrict__ t0, float * __restrict__ t1, const int64_t lo, const int64_t hi) {
+    const int64_t i = lo + (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < hi) {
+        const float s = t0[i] + t1[i];
+        t0[i] = s;
+        t1[i] = s;
+    }
+}
+
+static void ggml_cuda_apply_deferred_wait(ggml_backend_cuda_context * ctx);
+
 static bool ggml_backend_cuda_comm_try_allreduce_butterfly(
-        ggml_backend_cuda_comm_context *, struct ggml_tensor **) {
-    return false;
+        ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    static int ok = -1; // -1 unknown, 0 off, 1 on; one comm context per process in practice
+    static cudaEvent_t ready[2], done[2];
+    if (comm_ctx->backends.size() != 2) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx[2] = {
+        (ggml_backend_cuda_context *) comm_ctx->backends[0]->context,
+        (ggml_backend_cuda_context *) comm_ctx->backends[1]->context,
+    };
+    if (ok < 0) {
+        ok = 0;
+        const int p0 = ggml_cuda_get_physical_device(ctx[0]->device);
+        const int p1 = ggml_cuda_get_physical_device(ctx[1]->device);
+        int can01 = 0, can10 = 0;
+        if (p0 != p1) {
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can01, p0, p1));
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can10, p1, p0));
+        }
+        static const int env = ggml_cuda_pascal_env("GGML_PASCAL_AR_P2P");
+        if (ggml_cuda_pascal_lever(env, ggml_cuda_info().devices[ctx[0]->device].cc) && ggml_cuda_p2p_enabled() &&
+                can01 && can10) {
+            for (int j = 0; j < 2; ++j) {
+                ggml_cuda_set_device(ctx[j]->device);
+                CUDA_CHECK(cudaEventCreateWithFlags(&ready[j], cudaEventDisableTiming));
+                CUDA_CHECK(cudaEventCreateWithFlags(&done[j],  cudaEventDisableTiming));
+            }
+            ok = 1;
+            GGML_LOG_INFO("%s: decode-sized exchanges use the one-kernel P2P AllReduce\n", __func__);
+        }
+    }
+    if (ok != 1) {
+        return false;
+    }
+    const int64_t ne = ggml_nelements(tensors[0]);
+    if (ne == 0 || ne*sizeof(float) > 256*1024) {
+        return false;
+    }
+    for (int j = 0; j < 2; ++j) {
+        const ggml_tensor * t = tensors[j];
+        if (t == nullptr || t->type != GGML_TYPE_F32 || ggml_nelements(t) != ne || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+
+    float * d[2] = {(float *) tensors[0]->data, (float *) tensors[1]->data};
+    const int64_t half = (ne + 1) / 2;
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(ctx[j]->device);
+        ggml_cuda_apply_deferred_wait(ctx[j]);
+        CUDA_CHECK(cudaEventRecord(ready[j], ctx[j]->stream()));
+    }
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(ctx[j]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[j]->stream(), ready[1 - j], 0));
+        const int64_t lo = j == 0 ? 0 : half;
+        const int64_t hi = j == 0 ? half : ne;
+        if (hi > lo) {
+            k_ar_p2p_f32<<<(int) ((hi - lo + 255) / 256), 256, 0, ctx[j]->stream()>>>(d[0], d[1], lo, hi);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaEventRecord(done[j], ctx[j]->stream()));
+    }
+    for (int j = 0; j < 2; ++j) {
+        ggml_cuda_set_device(ctx[j]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ctx[j]->stream(), done[1 - j], 0));
+    }
+    return true;
 }
 
 static void ggml_backend_cuda_comm_free(void * comm_ctx_v) {

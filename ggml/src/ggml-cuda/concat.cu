@@ -1,4 +1,5 @@
 #include "concat.cuh"
+#include "gated_delta_net.cuh"
 
 #include <stdint.h>
 
@@ -139,8 +140,46 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim-0 concat whose src0 is a skipped GET_ROWS of cache rows (one per i2), read in place through the row
+// index (ggml_cuda_try_gdn_state_gather, H74). One thread per output element.
+template <typename T>
+static __global__ void concat_dim0_gathered(
+        const char * src0, const char * src1, char * dst, const int64_t n,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02,
+        const uint64_t nb00, const uint64_t nb01,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int64_t ne0, const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3,
+        const int32_t * src0_rows, const uint64_t src0_row_bytes) {
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int64_t i0 = idx % ne0;
+    int64_t r = idx / ne0;
+    const int64_t i1 = r % ne01; r /= ne01;
+    const int64_t i2 = r % ne02;
+    const int64_t i3 = r / ne02;
+    const T * x = i0 < ne00 ? (const T *)(src0 + (int64_t) src0_rows[i2]*src0_row_bytes + i1*nb01 + i0*nb00)
+                            : (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+    *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
+    const float *   g_base = nullptr;
+    const int32_t * g_idx  = nullptr;
+    int64_t         g_row  = 0;
+    if (ggml_cuda_gdn_gather_lookup(dst, &g_base, &g_idx, &g_row)) {
+        GGML_ASSERT(dim == 0 && !ggml_is_quantized(src0->type));
+        const int64_t n = ggml_nelements(dst);
+        concat_dim0_gathered<T><<<(int) ((n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE), CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) g_base, (const char *) src1->data, (char *) dst->data, n,
+            src0->ne[0], dst->ne[1], dst->ne[2], src0->nb[0], src0->nb[1],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->ne[0], dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+            g_idx, (uint64_t) g_row*sizeof(float));
+        return;
+    }
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
         const T * src0_d = (const T *) src0->data;
         const T * src1_d = (const T *) src1->data;

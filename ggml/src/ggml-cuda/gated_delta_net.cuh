@@ -12,3 +12,11 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// Recurrent-state gather read in place (H74, port of the reference build's). build_rs gathers each sequence's
+// state from its cache slot with a GET_ROWS whose only consumer is the gated delta net (or the conv state's
+// narrow CONCAT). The graph executor skips such a GET_ROWS and registers it here; the consumer then reads
+// the rows in place through the row index. See ggml_cuda_try_gdn_state_gather.
+void ggml_cuda_gdn_gather_reset();
+void ggml_cuda_gdn_gather_register(const ggml_tensor * consumer, const float * base, const int32_t * idx, int64_t row);
+bool ggml_cuda_gdn_gather_lookup(const ggml_tensor * consumer, const float ** base, const int32_t ** idx, int64_t * row);

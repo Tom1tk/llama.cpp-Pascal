@@ -2806,20 +2806,9 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
-// GGML_PASCAL_GRAPHS=1 (H73): CUDA graphs on cc < Volta. Upstream's gate is a perf call; H27 measured it
-// at -1.1% when decode was GPU bound, but decode is now host bound on the per-segment launches.
-static bool ggml_cuda_pascal_graphs_enabled() {
-    static const bool enabled = ggml_cuda_pascal_env("GGML_PASCAL_GRAPHS") > 0;
-    return enabled;
-}
-
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
-    // the meta backend's 1-node exchange graphs alternate shape and would recapture every call
-    if (ggml_cuda_pascal_graphs_enabled() && cgraph->n_nodes <= 1) {
-        return false;
-    }
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -4883,7 +4872,7 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA && !ggml_cuda_pascal_graphs_enabled()) {
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch && ggml_cuda_graph_debug_enabled()) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
             }

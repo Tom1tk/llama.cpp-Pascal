@@ -41,6 +41,42 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
     cpy_1(cx + x_offset, cdst + dst_offset);
 }
 
+// cpy_scalar with 32-bit multiply-shift indices: sm_60 has no integer divider, so the generic kernel's
+// 64-bit divisions dominate small copies (H79, ported from the reference build).
+// GGML_PASCAL_CPY_FASTDIV=0 turns it off.
+template <cpy_kernel_t cpy_1>
+static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const uint32_t ne,
+                                          const uint3 ne00_ne01_ne02, const uint3 ne00_ne01, const uint3 ne00,
+                                          const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+                                          const uint3 ne10_ne11_ne12, const uint3 ne10_ne11, const uint3 ne10,
+                                          const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= ne) {
+        return;
+    }
+
+    const uint32_t i03 = fastdiv(i, ne00_ne01_ne02);
+    const uint32_t r3  = i - i03*ne00_ne01_ne02.z;
+    const uint32_t i02 = fastdiv(r3, ne00_ne01);
+    const uint32_t r2  = r3 - i02*ne00_ne01.z;
+    const uint32_t i01 = fastdiv(r2, ne00);
+    const uint32_t i00 = r2 - i01*ne00.z;
+    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
+
+    const uint32_t i13 = fastdiv(i, ne10_ne11_ne12);
+    const uint32_t s3  = i - i13*ne10_ne11_ne12.z;
+    const uint32_t i12 = fastdiv(s3, ne10_ne11);
+    const uint32_t s2  = s3 - i12*ne10_ne11.z;
+    const uint32_t i11 = fastdiv(s2, ne10);
+    const uint32_t i10 = s2 - i11*ne10.z;
+    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
+
+    ggml_cuda_pdl_sync();
+    cpy_1(cx + x_offset, cdst + dst_offset);
+}
+
 template <typename T>
 static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -212,6 +248,19 @@ static void ggml_cpy_scalar_cuda(
         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
+        static const int fastdiv_env = ggml_cuda_pascal_env("GGML_PASCAL_CPY_FASTDIV");
+        // fastdiv needs n + mulhi(n, mp) to fit 32 bits: every index below 2^31
+        const int64_t fastdiv_max = int64_t(1) << 31;
+        if (ggml_cuda_pascal_lever(fastdiv_env, ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+                ne < fastdiv_max && ne00*ne01*ne02 < fastdiv_max && ne10*ne11*ne12 < fastdiv_max) {
+            ggml_cuda_kernel_launch(cpy_scalar_fastdiv<cpy_1_scalar<src_t, dst_t>>, launch_params,
+                cx, cdst, (uint32_t) ne,
+                init_fastdiv_values(ne00*ne01*ne02), init_fastdiv_values(ne00*ne01), init_fastdiv_values(ne00),
+                nb00, nb01, nb02, nb03,
+                init_fastdiv_values(ne10*ne11*ne12), init_fastdiv_values(ne10*ne11), init_fastdiv_values(ne10),
+                nb10, nb11, nb12, nb13);
+            return;
+        }
         ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
             cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
     };

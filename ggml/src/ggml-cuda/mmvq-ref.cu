@@ -2168,6 +2168,10 @@ bool ggml_cuda_mmvq_ref_can_use(const ggml_tensor * src0, const ggml_tensor * sr
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ4_XS:
             return true;
+        case GGML_TYPE_IQ4_NL: { // H80; IQ3_S stays on mmvh, which is faster for it
+            static const int env_iq4_nl = ggml_cuda_pascal_env("GGML_PASCAL_MMVQ_REF_IQ4NL");
+            return ggml_cuda_pascal_lever(env_iq4_nl, cc);
+        }
         default:
             return false;
     }

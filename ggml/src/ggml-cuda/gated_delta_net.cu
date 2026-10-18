@@ -202,7 +202,11 @@ static void launch_gated_delta_net(
     // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
     // SMs without a CTA, so small head counts keep the device filled
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-    const int cols_per_warp = gdn_cols_per_warp;
+    // Pascal: one column per warp at S_v 128 (4x the CTAs, fewer registers), as the reference build
+    // does; GGML_PASCAL_GDN_COL1=0 keeps four (H81)
+    static const int col1_env = ggml_cuda_pascal_env("GGML_PASCAL_GDN_COL1");
+    const bool col1 = S_v == 128 && ggml_cuda_pascal_lever(col1_env, ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+    const int cols_per_warp = col1 ? 1 : gdn_cols_per_warp;
     int num_warps = 4;
     while (num_warps > 1 && H*n_seqs*(S_v / (cols_per_warp * num_warps)) < nsm) {
         num_warps /= 2;
@@ -236,6 +240,13 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
+            if (col1) {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, 1>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_idx, s_row);
+                break;
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,

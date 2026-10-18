@@ -24,15 +24,17 @@
 // Every lever below is on by default on sm_60 (ggml_cuda_pascal_lever).
 // GGML_CUDA_PASCAL_MMVH: mmvh itself. GGML_PASCAL_MMVH_LOWBIT: Q3_K, Q2_K, IQ4_NL and the IQ2 family
 // on mmvh (otherwise mmvq). GGML_PASCAL_MMVH_Q6K_WIDE (H41): Q6_K with 4 lanes per superblock instead of 8.
+// GGML_PASCAL_MMVH_IQ4XS_1COL (H69): IQ4_XS on mmvh only at 1 column; mmvq is faster at verify widths.
 static bool mmvh_lever(const int lever, const int cc) {
-    static const int env[3] = {
+    static const int env[4] = {
         ggml_cuda_pascal_env("GGML_CUDA_PASCAL_MMVH"),
         ggml_cuda_pascal_env("GGML_PASCAL_MMVH_LOWBIT"),
         ggml_cuda_pascal_env("GGML_PASCAL_MMVH_Q6K_WIDE"),
+        ggml_cuda_pascal_env("GGML_PASCAL_MMVH_IQ4XS_1COL"),
     };
     return ggml_cuda_pascal_lever(env[lever], cc);
 }
-enum { MMVH_ON, MMVH_LOWBIT, MMVH_Q6K_WIDE };
+enum { MMVH_ON, MMVH_LOWBIT, MMVH_Q6K_WIDE, MMVH_IQ4XS_1COL };
 
 bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -43,9 +45,13 @@ bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, 
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_Q6_K:
-        case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ3_XXS:
+            break;
+        case GGML_TYPE_IQ4_XS:
+            if (src1->ne[1] > 1 && mmvh_lever(MMVH_IQ4XS_1COL, cc)) {
+                return false;
+            }
             break;
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q2_K:

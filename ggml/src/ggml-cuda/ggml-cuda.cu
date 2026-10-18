@@ -3848,7 +3848,7 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i, co
     static bool logged = false;
     if (!logged) {
         logged = true;
-        GGML_LOG_INFO("%s: GDN state gather skipped (%s)\n", __func__, ggml_op_name(gdn->op));
+        fprintf(stderr, "%s: GDN state gather skipped (%s)\n", __func__, ggml_op_name(gdn->op)); // llama-bench silences ggml logs
     }
     return true;
 }

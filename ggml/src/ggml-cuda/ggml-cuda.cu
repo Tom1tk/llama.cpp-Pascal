@@ -3513,6 +3513,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     GGML_ASSERT(unary_ops.size() == num_unary);
 #endif
 
+    // every pattern below needs nodes[node_idx]->op == ops[0]; most calls from ggml_cuda_try_fuse fail
+    // here, so skip the list compares and the subgraph walk (decode is host bound on Pascal, H77)
+    if (cgraph->nodes[node_idx]->op != *ops.begin()) {
+        return false;
+    }
+
     const auto is_equal = [](const std::initializer_list<enum ggml_op> & list1,
                              const std::initializer_list<enum ggml_op> & list2) {
         return std::equal(list1.begin(), list1.end(), list2.begin(), list2.end());

@@ -1722,7 +1722,17 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
 
     static const bool env_pdl_enabled = []() {
         const char * env = getenv("GGML_CUDA_PDL");
-        return env == nullptr || std::atoi(env) != 0;
+        if (env != nullptr) {
+            return std::atoi(env) != 0;
+        }
+        // PDL needs Hopper; without one, skip the per-launch cache lookup (a mutex and cudaGetDevice, H78)
+        const ggml_cuda_device_info & info = ggml_cuda_info();
+        for (int id = 0; id < info.device_count; ++id) {
+            if (GGML_CUDA_CC_IS_NVIDIA(info.devices[id].cc) && info.devices[id].cc >= GGML_CUDA_CC_HOPPER) {
+                return true;
+            }
+        }
+        return false;
     }();
 
     if (env_pdl_enabled && ggml_cuda_kernel_can_use_pdl(reinterpret_cast<const void *>(kernel))) {

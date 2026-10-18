@@ -2,7 +2,6 @@
 #include "unary.cuh"
 #include "mmvq.cuh"
 
-#include <mutex>
 #include <unordered_map>
 
 // q6_K x f32 matvec for 2..16 columns on Pascal, in fp16 with short chains folded into fp32.
@@ -2815,10 +2814,8 @@ struct mmvq_f16_cache {
     int                 device = -1; // the buffer's device: a freed context's address can be reused by one on another GPU
 };
 static std::unordered_map<const ggml_backend_cuda_context *, mmvq_f16_cache> mmvq_f16_caches;
-static std::mutex mmvq_f16_caches_mutex; // the meta backend may dispatch each device from its own thread
 
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx) {
-    std::lock_guard<std::mutex> lock(mmvq_f16_caches_mutex);
     auto it = mmvq_f16_caches.find(&ctx);
     if (it != mmvq_f16_caches.end()) {
         it->second.src1 = nullptr;
@@ -2952,10 +2949,7 @@ static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
 
-    mmvq_f16_cache & cache = [&]() -> mmvq_f16_cache & {
-        std::lock_guard<std::mutex> lock(mmvq_f16_caches_mutex);
-        return mmvq_f16_caches[&ctx];
-    }();
+    mmvq_f16_cache & cache = mmvq_f16_caches[&ctx];
     if (cache.device != ctx.device) {
         // a stale entry from a destroyed context on another device: its buffer is not usable here
         if (cache.buf) {

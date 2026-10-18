@@ -6,7 +6,44 @@
 // its contiguous run of blocks in with aligned uint4 loads from the 16-byte boundary below it, keeps
 // the misalignment in shared memory (free there) and runs the stock vec_dot on the staged copy.
 // The q8_1 activation is staged the same way: its 36-byte blocks make the direct reads fan out.
-// ponytail: Q6_K only; other types and the per-trip address hoist are a follow-up if this pays.
+// ponytail: Q6_K only; other types are a follow-up if this pays.
+
+// The reference build's Q6_K dot product: 4 quant words per lane with integer accumulation across
+// them (Pascal has no IMAD, so the per-word scale multiply and int->float conversion are paid once
+// per group), and the -32 bias folded into the unpack as a sign flip instead of __vsub4, which
+// ptxas emulates in 6-9 instructions. Peak |acc| is 4*4*128*128, exact in float.
+#define VDR_Q6_K_STAGE 4
+
+static __device__ __forceinline__ float vec_dot_q6_K_q8_1_stage(
+        const block_q6_K * __restrict__ bq6_K, const block_q8_1 * __restrict__ bq8_1, const int iqs) {
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int qh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
+    const int8_t * scales  = bq6_K->scales + scale_offset;
+
+    int acc[QR6_K] = { 0 };
+#pragma unroll
+    for (int l = 0; l < VDR_Q6_K_STAGE; ++l) {
+        const int vl = get_int_b2(bq6_K->ql, iqs + l);
+        const int vh = get_int_b2(bq6_K->qh, qh_idx + l) >> vh_shift;
+#pragma unroll
+        for (int i = 0; i < QR6_K; ++i) {
+            // 4*(q - 32) as packed int8: the sign lands in bit 7, undone by the 0.25f below
+            const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
+            const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
+            acc[i] = ggml_cuda_dp4a(vil4 | vih4, get_int_b4(bq8_1[bq8_offset + 2*i].qs, (iqs + l) % QI8_1), acc[i]);
+        }
+    }
+
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        sumf += (__low2float(bq8_1[bq8_offset + 2*i].ds) * (float) scales[4*i]) * (float) acc[i];
+    }
+    const float d = bq6_K->d;
+    return d * 0.25f * sumf;
+}
 
 #define MMVQ_STAGE_NWARPS 2
 #define MMVQ_STAGE_ROWS   2
@@ -17,7 +54,7 @@ static __global__ void mul_mat_vec_q6_K_stage(const char * __restrict__ vx, cons
                                               float * __restrict__ dst, const int ncols_x, const int nrows_x, const int stride_row_x) {
     constexpr int bs       = sizeof(block_q6_K);
     constexpr int ybs      = (QK_K/QK8_1)*sizeof(block_q8_1);
-    constexpr int lanes    = QI6_K/VDR_Q6_K_Q8_1_MMVQ;  // lanes per block
+    constexpr int lanes    = QI6_K/VDR_Q6_K_STAGE;  // lanes per block
     constexpr int bpw      = WARP_SIZE/lanes;           // blocks per warp per trip
     constexpr int x_u4     = (bpw*bs  + 30)/16;         // + slack for the misalignment
     constexpr int y_u4     = (bpw*ybs + 30)/16;
@@ -33,21 +70,37 @@ static __global__ void mul_mat_vec_q6_K_stage(const char * __restrict__ vx, cons
     const int row0 = rows*blockIdx.x;
     const int nblk = ncols_x/QK_K;
     const int sub  = lane/lanes;
-    const int kqs  = VDR_Q6_K_Q8_1_MMVQ*(lane % lanes);
+    const int kqs  = VDR_Q6_K_STAGE*(lane % lanes);
 
     float tmp[rows] = {0.0f};
     int   mis[rows];
 
-    for (int kb = w*bpw; kb < nblk; kb += nwarps*bpw) {
-        const int n = min(bpw, nblk - kb);
+    // addresses advance per trip instead of being recomputed: Pascal has no IMAD, so a 64-bit
+    // index multiply per row per trip costs a run of XMADs
+    constexpr int stride = nwarps*bpw; // blocks per trip of the whole CTA
+    const char * xcur[rows];
+#pragma unroll
+    for (int i = 0; i < rows; ++i) {
+        // clamp: surplus rows of the last block are computed on the last row and dropped at write-back
+        xcur[i] = vx + (size_t(min(row0 + i, nrows_x - 1))*stride_row_x + w*bpw)*bs;
+    }
+    const char * ycur = (const char *) (y + w*bpw*(QK_K/QK8_1));
+    int xleft = (nblk - w*bpw)*bs;
+    int yleft = (nblk - w*bpw)*ybs;
+
+    for (int kb = w*bpw; kb < nblk; kb += stride) {
+        const int nx = min(bpw*bs,  xleft);
+        const int ny = min(bpw*ybs, yleft);
+        xleft -= stride*bs;
+        yleft -= stride*ybs;
         __syncwarp(); // the previous trip's readers are done with the stage
 #pragma unroll
         for (int i = 0; i < rows; ++i) {
-            // clamp: surplus rows of the last block are computed on the last row and dropped at write-back
-            const char  * g   = vx + (size_t(min(row0 + i, nrows_x - 1))*stride_row_x + kb)*bs;
+            const char  * g   = xcur[i];
+            xcur[i] += stride*bs;
             const int     m   = (int) ((uintptr_t) g & 15);
             const uint4 * g16 = (const uint4 *) (g - m);
-            const int     nu4 = (m + n*bs + 15) >> 4;
+            const int     nu4 = (m + nx + 15) >> 4;
             mis[i] = m;
 #pragma unroll
             for (int r = 0; r < x_rounds; ++r) { // compile-time trip count keeps these LDG, not generic loads
@@ -56,10 +109,11 @@ static __global__ void mul_mat_vec_q6_K_stage(const char * __restrict__ vx, cons
                 }
             }
         }
-        const char  * yg   = (const char *) (y + kb*(QK_K/QK8_1));
+        const char  * yg   = ycur;
+        ycur += stride*ybs;
         const int     ym   = (int) ((uintptr_t) yg & 15);
         const uint4 * yg16 = (const uint4 *) (yg - ym);
-        const int     nyu4 = (ym + n*ybs + 15) >> 4;
+        const int     nyu4 = (ym + ny + 15) >> 4;
 #pragma unroll
         for (int r = 0; r < y_rounds; ++r) {
             if (r*WARP_SIZE + lane < nyu4) {
@@ -72,7 +126,7 @@ static __global__ void mul_mat_vec_q6_K_stage(const char * __restrict__ vx, cons
             const block_q8_1 * yb = (const block_q8_1 *) ((const char *) ys[w] + ym + sub*ybs);
 #pragma unroll
             for (int i = 0; i < rows; ++i) {
-                tmp[i] += vec_dot_q6_K_q8_1((const char *) xs[w][i] + mis[i] + sub*bs, yb, 0, kqs);
+                tmp[i] += vec_dot_q6_K_q8_1_stage((const block_q6_K *) ((const char *) xs[w][i] + mis[i] + sub*bs), yb, kqs);
             }
         }
     }

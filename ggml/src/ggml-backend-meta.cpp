@@ -11,11 +11,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -402,7 +404,7 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
-    std::map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
+    std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
     ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
         ctxs.reserve(n_simple);
@@ -431,7 +433,14 @@ struct ggml_backend_meta_buffer_context {
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
     static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
-    std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
+    // H83 (from the reference build): hashed, not ordered. A graph rebuild looks up ~11k split states.
+    struct split_state_key_hash {
+        size_t operator()(const std::pair<const ggml_tensor *, bool> & k) const {
+            return std::hash<const void *>()(k.first) ^ (k.second ? size_t(0x9e3779b97f4a7c15ull) : 0);
+        }
+    };
+    std::unordered_map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>,
+        split_state_key_hash> split_state_cache;
 
     int debug;
 
@@ -856,10 +865,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             return ret;
         }
 
-        std::vector<ggml_backend_meta_split_state> src_ss(GGML_MAX_SRC, {GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
+        // H83: one source-state vector per recursion depth, reused (each state is ~2 KB). A deque, so growing it
+        // for a deeper call does not move the vectors shallower calls hold.
+        static thread_local std::deque<std::vector<ggml_backend_meta_split_state>> src_ss_pool;
+        static thread_local size_t src_ss_depth = 0;
+        if (src_ss_pool.size() <= src_ss_depth) {
+            src_ss_pool.emplace_back(GGML_MAX_SRC, ggml_backend_meta_split_state{GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1});
+        }
+        std::vector<ggml_backend_meta_split_state> & src_ss = src_ss_pool[src_ss_depth];
+        struct depth_guard {
+            size_t & d;
+            explicit depth_guard(size_t & d) : d(d) { d++; }
+            ~depth_guard() { d--; }
+        } guard(src_ss_depth);
         for (size_t i = 0; i < GGML_MAX_SRC; i++) {
             if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
-                src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
+                // only axis, n_segments and nr[0] are read for an absent source
+                src_ss[i].axis       = GGML_BACKEND_SPLIT_AXIS_UNKNOWN;
+                src_ss[i].n_segments = 1;
+                src_ss[i].nr[0]      = 1;
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
@@ -1123,8 +1147,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
     }
 
     if (it == buf_ctx->split_state_cache.end()) {
-        buf_ctx->split_state_cache[key].first = calculate_split_state();
-        memcpy(buf_ctx->split_state_cache[key].second, tensor, sizeof(buf_ctx->split_state_cache[key].second));
+        // computed before the entry is looked up: the computation recurses into the sources, which inserts into
+        // (and may clear) this cache
+        const ggml_backend_meta_split_state computed = calculate_split_state();
+        auto & entry = buf_ctx->split_state_cache[key];
+        entry.first = computed;
+        memcpy(entry.second, tensor, sizeof(entry.second));
         if (buf_ctx->debug > 0) {
             std::string srcs_info;
             for (size_t i = 0; i < GGML_MAX_SRC; i++) {
@@ -1160,7 +1188,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         }
     }
 
-    ggml_backend_meta_split_state ret = buf_ctx->split_state_cache[key].first;
+    // looked up again: the debug output above recurses too, and a rehash invalidates iterators
+    ggml_backend_meta_split_state ret = (it != buf_ctx->split_state_cache.end() ? it : buf_ctx->split_state_cache.find(key))->second.first;
     GGML_ASSERT(ret.axis != GGML_BACKEND_SPLIT_AXIS_NONE);
 #ifndef NDEBUG
     if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {

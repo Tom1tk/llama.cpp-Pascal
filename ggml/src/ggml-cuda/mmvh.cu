@@ -1,8 +1,6 @@
 #include "mmvh.cuh"
 #include "vecdotq.cuh"
 
-#include <unordered_map>
-
 // How it works (D2 in docs/pascal/fork-plan-2026-10-14.md):
 //
 // GP100 has no dp4a, so mmvq's int8 dot products are emulated (BFE + XMAD per
@@ -26,17 +24,15 @@
 // Every lever below is on by default on sm_60 (ggml_cuda_pascal_lever).
 // GGML_CUDA_PASCAL_MMVH: mmvh itself. GGML_PASCAL_MMVH_LOWBIT: Q3_K, Q2_K, IQ4_NL and the IQ2 family
 // on mmvh (otherwise mmvq). GGML_PASCAL_MMVH_Q6K_WIDE (H41): Q6_K with 4 lanes per superblock instead of 8.
-// GGML_PASCAL_MMVH_YCACHE (H68): reuse the converted activation across matvecs that share src1.
 static bool mmvh_lever(const int lever, const int cc) {
-    static const int env[4] = {
+    static const int env[3] = {
         ggml_cuda_pascal_env("GGML_CUDA_PASCAL_MMVH"),
         ggml_cuda_pascal_env("GGML_PASCAL_MMVH_LOWBIT"),
         ggml_cuda_pascal_env("GGML_PASCAL_MMVH_Q6K_WIDE"),
-        ggml_cuda_pascal_env("GGML_PASCAL_MMVH_YCACHE"),
     };
     return ggml_cuda_pascal_lever(env[lever], cc);
 }
-enum { MMVH_ON, MMVH_LOWBIT, MMVH_Q6K_WIDE, MMVH_YCACHE };
+enum { MMVH_ON, MMVH_LOWBIT, MMVH_Q6K_WIDE };
 
 bool ggml_cuda_mmvh_can_use(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -99,27 +95,6 @@ static __global__ void mmvh_convert_y(const float * __restrict__ x, half * __res
 
     if (lane == 0) {
         meta[col*(ncols_padded/32) + blockIdx.x] = make_float4(amax * 1024.0f, sum, hi_sum, 0.0f);
-    }
-}
-
-// Converted-activation cache, one per backend context (device). q/k/v and gate/up read the same src1,
-// so converting it once per graph evaluation removes a launch per matvec on the host-bound decode path.
-// Keyed on the tensor and its data; node pointers are reused across evaluations with fresh data, so
-// ggml_cuda_mmvh_invalidate runs at the start of every graph compute.
-struct mmvh_y_cache {
-    const ggml_tensor * src1 = nullptr;
-    const void *        data = nullptr;
-    int64_t             ncols = 0, ne00 = 0, s11 = 0;
-    char *              buf  = nullptr;
-    size_t              cap  = 0;
-};
-static std::unordered_map<const ggml_backend_cuda_context *, mmvh_y_cache> mmvh_y_caches;
-
-void ggml_cuda_mmvh_invalidate(ggml_backend_cuda_context & ctx) {
-    auto it = mmvh_y_caches.find(&ctx);
-    if (it != mmvh_y_caches.end()) {
-        it->second.src1 = nullptr;
-        it->second.data = nullptr;
     }
 }
 
@@ -662,36 +637,13 @@ void ggml_cuda_mul_mat_vec_h(ggml_backend_cuda_context & ctx,
     const int64_t nrows = src0->ne[1];
     const int64_t ncols = src1->ne[1];
 
-    const int64_t s11 = src1->nb[1] / sizeof(float);
-    const size_t  xh_bytes = ncols*ne00*sizeof(half);
-    const size_t  need     = xh_bytes + ncols*(ne00/32)*sizeof(float4);
+    ggml_cuda_pool_alloc<half>   xh(ctx.pool(), ncols*ne00);
+    ggml_cuda_pool_alloc<float4> meta(ctx.pool(), ncols*ne00/32);
 
-    ggml_cuda_pool_alloc<char> tmp(ctx.pool());
-    char * buf;
-    bool   hit = false;
-    if (mmvh_lever(MMVH_YCACHE, ggml_cuda_info().devices[ctx.device].cc)) {
-        mmvh_y_cache & c = mmvh_y_caches[&ctx];
-        hit = c.src1 == src1 && c.data == src1->data && c.ncols == ncols && c.ne00 == ne00 && c.s11 == s11;
-        if (!hit) {
-            if (c.cap < need) {
-                if (c.buf) {
-                    CUDA_CHECK(cudaFree(c.buf)); // synchronizes; only when the buffer grows
-                }
-                CUDA_CHECK(cudaMalloc(&c.buf, need));
-                c.cap = need;
-            }
-            c.src1 = src1; c.data = src1->data; c.ncols = ncols; c.ne00 = ne00; c.s11 = s11;
-        }
-        buf = c.buf;
-    } else {
-        buf = tmp.alloc(need);
-    }
-    half   * xh   = (half *) buf;
-    float4 * meta = (float4 *) (buf + xh_bytes); // xh_bytes is a multiple of 16: ne00 % 256 == 0
-
-    if (!hit) {
+    {
         const dim3 grid(ne00/32, ncols);
-        mmvh_convert_y<<<grid, WARP_SIZE, 0, stream>>>((const float *) src1->data, xh, meta, s11, ne00);
+        mmvh_convert_y<<<grid, WARP_SIZE, 0, stream>>>((const float *) src1->data, xh.get(), meta.get(),
+            src1->nb[1] / sizeof(float), ne00);
     }
 
     const char  * vx  = (const char *) src0->data;
@@ -700,44 +652,44 @@ void ggml_cuda_mul_mat_vec_h(ggml_backend_cuda_context & ctx,
 
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
-            mul_mat_vec_h_cuda<GGML_TYPE_Q4_K>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_Q4_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_Q5_K:
-            mul_mat_vec_h_cuda<GGML_TYPE_Q5_K>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_Q5_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_Q6_K:
             if (mmvh_lever(MMVH_Q6K_WIDE, ggml_cuda_info().devices[ctx.device].cc)) {
-                mul_mat_vec_h_cuda<GGML_TYPE_Q6_K, 4>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+                mul_mat_vec_h_cuda<GGML_TYPE_Q6_K, 4>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             } else {
-                mul_mat_vec_h_cuda<GGML_TYPE_Q6_K>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+                mul_mat_vec_h_cuda<GGML_TYPE_Q6_K>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             }
             break;
         case GGML_TYPE_IQ4_XS:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ4_XS>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ4_XS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ4_NL:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ4_NL>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ4_NL>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ3_S:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ3_S>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ3_S>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_Q3_K:
-            mul_mat_vec_h_cuda<GGML_TYPE_Q3_K, 4>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_Q3_K, 4>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_Q2_K:
-            mul_mat_vec_h_cuda<GGML_TYPE_Q2_K, 4>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_Q2_K, 4>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ2_S:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ2_S>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ2_S>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ2_XS:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ2_XS>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ2_XS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ2_XXS>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ2_XXS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
-            mul_mat_vec_h_cuda<GGML_TYPE_IQ3_XXS>(vx, xh, meta, d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
+            mul_mat_vec_h_cuda<GGML_TYPE_IQ3_XXS>(vx, xh.get(), meta.get(), d, ne00, nrows, ncols, src0->nb[1], ne00, sdc, stream);
             break;
         default:
             GGML_ABORT("fatal error");

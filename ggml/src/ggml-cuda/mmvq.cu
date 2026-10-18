@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvh.cuh"
+#include "mmvq-stage.cuh"
 #include "mmvq-f16.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1458,7 +1459,10 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 
-    if (!ids && !fusion && ggml_cuda_mmvh_can_use(src0, src1, dst)) {
+    // Pascal: one-column Q6_K takes the staged q8_1 kernel instead of mmvh (H71, mmvq-stage.cu)
+    const bool stage = !ids && !fusion && ggml_cuda_mmvq_stage_can_use(src0, src1, dst);
+
+    if (!stage && !ids && !fusion && ggml_cuda_mmvh_can_use(src0, src1, dst)) {
         ggml_cuda_mul_mat_vec_h(ctx, src0, src1, dst);
         return;
     }
@@ -1567,6 +1571,11 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    if (stage) {
+        ggml_cuda_mmvq_stage(src0->data, src1_q8_1.get(), dst_d, ne00, ne01, s01, stream);
+        return;
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,

@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-f16.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -4800,6 +4801,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
     ggml_cuda_apply_deferred_wait(cuda_ctx);
+    ggml_cuda_mmvq_f16_invalidate(*cuda_ctx); // node pointers are reused with fresh data across evaluations
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

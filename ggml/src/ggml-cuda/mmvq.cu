@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvh.cuh"
+#include "mmvq-f16.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1451,6 +1452,11 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+
+    // Pascal: fp16 multi-column kernels (q4_K/q5_K/q6_K/q2_K...) for the verify widths where they beat mmvh (mmvq-f16.cu)
+    if (!ids && !fusion && ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11)) {
+        return;
+    }
 
     if (!ids && !fusion && ggml_cuda_mmvh_can_use(src0, src1, dst)) {
         ggml_cuda_mul_mat_vec_h(ctx, src0, src1, dst);

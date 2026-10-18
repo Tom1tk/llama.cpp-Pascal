@@ -157,7 +157,7 @@ static __global__ void mul_mat_vec_q6_K_stage(const char * __restrict__ vx, cons
 bool ggml_cuda_mmvq_stage_can_use(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     static const int env = ggml_cuda_pascal_env("GGML_PASCAL_MMVQ_STAGE");
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return ggml_cuda_pascal_lever(env, cc) && cc == GGML_CUDA_CC_PASCAL &&
+    return env > 0 && cc == GGML_CUDA_CC_PASCAL && // opt-in: H71b +1.47% tg32, under its gate, quality unchecked
         src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
         src1->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
         src0->ne[0] % QK_K == 0;

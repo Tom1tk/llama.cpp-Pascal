@@ -3813,8 +3813,8 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i, co
         if (n->view_src && is_alias(n->view_src)) {
             uses = true;
         }
-        if (!uses) {
-            continue;
+        if (!uses || ggml_nelements(n) == 0) {
+            continue; // build_rs's zero-row states_extra view of a single-sequence gather reads nothing
         }
         if ((n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) && n->view_offs == 0 &&
                 ggml_nbytes(n) == ggml_nbytes(node) && ggml_is_contiguous(n) && !(n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
@@ -3845,6 +3845,11 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i, co
     }
     ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, (const int32_t *) node->src[1]->data,
                                   node->src[0]->nb[1] / sizeof(float));
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: GDN state gather skipped (%s)\n", __func__, ggml_op_name(gdn->op));
+    }
     return true;
 }
 

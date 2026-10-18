@@ -3863,6 +3863,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // conv state update: CONCAT -> CPY of its tail, or the K rollback snapshot CPYs, in one launch (H76)
+    if ((node->op == GGML_OP_CONCAT || node->op == GGML_OP_CPY) &&
+            ggml_cuda_conv_state_cpy_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        if (node->op == GGML_OP_CPY) {
+            const int n_skip = ggml_cuda_fuse_cpy_batch(*cuda_ctx, cgraph, i);
+            if (n_skip > 0) {
+                static bool logged = false;
+                if (!logged) { logged = true; fprintf(stderr, "%s: conv state cpy batch fired (%d copies)\n", __func__, n_skip + 1); }
+                return n_skip;
+            }
+        } else {
+            int j = i + 1;
+            while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                ++j;
+            }
+            if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_CPY && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    !(cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_cuda_op_concat_cpy(*cuda_ctx, node, cgraph->nodes[j])) {
+                static bool logged = false;
+                if (!logged) { logged = true; fprintf(stderr, "%s: conv state concat+cpy fired\n", __func__); }
+                return j - i;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
             ggml_cuda_should_fuse_mul_mat_vec_q(cgraph->nodes[i + 2]->src[1])) {

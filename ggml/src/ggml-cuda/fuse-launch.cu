@@ -8,6 +8,11 @@ bool ggml_cuda_fuse_launch_enabled(const int cc) {
     return ggml_cuda_pascal_lever(env, cc);
 }
 
+bool ggml_cuda_conv_state_cpy_enabled(const int cc) {
+    static const int env = ggml_cuda_pascal_env("GGML_PASCAL_CONV_STATE_CPY");
+    return ggml_cuda_pascal_lever(env, cc);
+}
+
 static bool overlaps(const ggml_tensor * x, const ggml_tensor * y) {
     const char * x0 = (const char *) x->data, * y0 = (const char *) y->data;
     return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
@@ -209,4 +214,72 @@ bool ggml_cuda_fuse_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tenso
         (const float *) m->data, (float *) mul->data, (int) ne0, (int) nrows, x->nb[1]/sizeof(float), mul->nb[1]/sizeof(float));
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+#define CPY_BATCH_MAX 8
+
+struct cpy_batch_args {
+    const char * src[CPY_BATCH_MAX];
+    char *       dst[CPY_BATCH_MAX];
+    int64_t ne0, ne1, ne2;
+    int64_t snb0, snb1, snb2, snb3;
+};
+
+static __global__ void k_cpy_batch_f32(const cpy_batch_args a, const int64_t n) {
+    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int k = blockIdx.y;
+    const int64_t i0 = idx % a.ne0;
+    int64_t r = idx / a.ne0;
+    const int64_t i1 = r % a.ne1; r /= a.ne1;
+    const int64_t i2 = r % a.ne2;
+    const int64_t i3 = r / a.ne2;
+    const float v = *(const float *) (a.src[k] + i0*a.snb0 + i1*a.snb1 + i2*a.snb2 + i3*a.snb3);
+    ((float *) a.dst[k])[idx] = v; // contiguous destination, in the source's element order (ggml_cpy)
+}
+
+int ggml_cuda_fuse_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * c0 = cgraph->nodes[i];
+    const ggml_tensor * s0 = c0->src[0];
+    const ggml_tensor * d0 = c0->src[1];
+    if (c0->op != GGML_OP_CPY || s0->type != GGML_TYPE_F32 || d0->type != GGML_TYPE_F32 || s0->view_src == nullptr ||
+            d0->view_src == nullptr || (c0->flags & GGML_TENSOR_FLAG_OUTPUT) || s0->view_src == d0->view_src) {
+        return 0;
+    }
+    cpy_batch_args a = {};
+    int n = 0;
+    int last = i;
+    for (int j = i; j < cgraph->n_nodes && n < CPY_BATCH_MAX; ++j) {
+        const ggml_tensor * c = cgraph->nodes[j];
+        if (j > i && (c->op == GGML_OP_VIEW || c->op == GGML_OP_RESHAPE || c->op == GGML_OP_NONE)) {
+            continue; // views between the copies
+        }
+        if (c->op != GGML_OP_CPY || (c->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        const ggml_tensor * s = c->src[0];
+        const ggml_tensor * d = c->src[1];
+        if (s->type != GGML_TYPE_F32 || d->type != GGML_TYPE_F32 || s->view_src != s0->view_src || d->view_src != d0->view_src ||
+                !ggml_are_same_shape(s, s0) || !ggml_are_same_shape(d, d0) || !ggml_is_contiguous(d) ||
+                ggml_nelements(d) != ggml_nelements(s) ||
+                memcmp(s->nb, s0->nb, sizeof(s->nb)) != 0 || memcmp(d->nb, d0->nb, sizeof(d->nb)) != 0) {
+            break;
+        }
+        a.src[n] = (const char *) s->data;
+        a.dst[n] = (char *) d->data;
+        ++n;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+    a.ne0 = s0->ne[0]; a.ne1 = s0->ne[1]; a.ne2 = s0->ne[2];
+    a.snb0 = s0->nb[0]; a.snb1 = s0->nb[1]; a.snb2 = s0->nb[2]; a.snb3 = s0->nb[3];
+    const int64_t ne = ggml_nelements(s0);
+    const dim3 grid((unsigned) ((ne + 255)/256), n);
+    k_cpy_batch_f32<<<grid, 256, 0, ctx.stream()>>>(a, ne);
+    CUDA_CHECK(cudaGetLastError());
+    return last - i;
 }

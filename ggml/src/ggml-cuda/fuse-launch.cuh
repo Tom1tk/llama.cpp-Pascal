@@ -18,3 +18,11 @@ bool ggml_cuda_fuse_rms_norm_scale2(ggml_backend_cuda_context & ctx, ggml_tensor
 
 // ADD(row bias) -> SOFTPLUS -> MUL(row scale) (the delta net's gate) in one launch
 bool ggml_cuda_fuse_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * sp, ggml_tensor * mul);
+
+// Conv state update copies (H76, ported from the reference build). Default on for sm_60,
+// GGML_PASCAL_CONV_STATE_CPY=0 disables; the concat half is ggml_cuda_op_concat_cpy (concat.cuh).
+bool ggml_cuda_conv_state_cpy_enabled(int cc);
+
+// consecutive same-shape f32 CPYs between views of the same two tensors (the delta net's K = n_rs_seq + 1
+// conv state rollback snapshots) in one launch; returns the nodes to skip after i, 0 = not fused
+int ggml_cuda_fuse_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);

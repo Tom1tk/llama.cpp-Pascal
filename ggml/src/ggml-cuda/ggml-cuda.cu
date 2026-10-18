@@ -36,6 +36,7 @@
 #include "ggml-cuda/mmvq-f16.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
+#include "ggml-cuda/fuse-launch.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
@@ -3970,6 +3971,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    const bool fuse_launch = ggml_cuda_fuse_launch_enabled(ggml_cuda_info().devices[cuda_ctx->device].cc);
+
+    // residual ADD -> RMS_NORM -> MUL (the next pre-norm). The sum stays a graph output of its own (the next
+    // residual), so this is not a plain chain for ggml_can_fuse: the multiply must be the norm's only consumer.
+    if (fuse_launch && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        ggml_tensor * rms = cgraph->nodes[i + 1];
+        ggml_tensor * mul = cgraph->nodes[i + 2];
+        if (rms->op == GGML_OP_RMS_NORM && rms->src[0] == node &&
+                mul->op == GGML_OP_MUL && (mul->src[0] == rms || mul->src[1] == rms) &&
+                (rms->flags & GGML_TENSOR_FLAG_COMPUTE) && (mul->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                !(rms->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+                !(i + 3 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_ADD &&
+                  (cgraph->nodes[i + 3]->src[0] == mul || cgraph->nodes[i + 3]->src[1] == mul)) &&
+                ggml_cuda_fuse_add_rms_norm_mul(*cuda_ctx, node, rms, mul)) {
+            return 2;
+        }
+    }
+
+    // ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate
+    if (fuse_launch && node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+            cgraph->nodes[i + 2]->op == GGML_OP_MUL) {
+        const enum ggml_op ops_g[3] = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+        if (ggml_can_fuse(cgraph, i, ops_g, 3) &&
+                ggml_cuda_fuse_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            return 2;
+        }
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;
@@ -4504,6 +4533,65 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // RMS_NORM -> MUL(w), then MUL_MAT(z) -> SILU -> MUL(norm): run the matmul first, then the norm with the
+    // silu gate in its epilogue (qwen35's gated norm)
+    if (fuse_launch && node->op == GGML_OP_RMS_NORM && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        const int n = cgraph->n_nodes;
+        auto next = [&](int j) {
+            for (++j; j < n; ++j) {
+                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        ggml_tensor * mulw = cgraph->nodes[i + 1];
+        const int jm = next(i + 1), js = jm < 0 ? -1 : next(jm), jo = js < 0 ? -1 : next(js);
+        if (jo > 0) {
+            ggml_tensor * mm = cgraph->nodes[jm], * sl = cgraph->nodes[js], * mo = cgraph->nodes[jo];
+            auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+            // the allocator planned memory for the graph order: once the norm has read x, the matmul's output
+            // may take x's buffer, so running the matmul first must not overwrite x. The output may take x's
+            // or the matmul's buffer only in place with the same layout (each row is read before it is written).
+            auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
+                return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+            };
+            auto same = [](const ggml_tensor * a, const ggml_tensor * b) {
+                return a->data == b->data && ggml_are_same_shape(a, b) && ggml_are_same_stride(a, b);
+            };
+            const ggml_tensor * xin = node->src[0];
+            const bool alias_ok = !overlap(mm, xin) && (!overlap(mo, mm) || same(mo, mm)) && (!overlap(mo, xin) || same(mo, xin));
+            if (mm->op == GGML_OP_MUL_MAT && sl->op == GGML_OP_UNARY && ggml_get_unary_op(sl) == GGML_UNARY_OP_SILU &&
+                    mo->op == GGML_OP_MUL && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) && (sl->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    (mo->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    base(sl->src[0]) == mm && sl->src[0]->view_offs == 0 && ggml_is_contiguous(sl->src[0]) &&
+                    ((mo->src[0] == sl && mo->src[1] == mulw) || (mo->src[1] == sl && mo->src[0] == mulw)) &&
+                    base(mm->src[0]) != node && base(mm->src[1]) != node && base(mm->src[0]) != mulw && base(mm->src[1]) != mulw &&
+                    ggml_node_get_use_count(cgraph, i + 1) == 1 && ggml_node_get_use_count(cgraph, js) == 1 &&
+                    !(mulw->flags & GGML_TENSOR_FLAG_OUTPUT) && !(sl->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    alias_ok && ggml_cuda_fuse_rms_norm_mul_silu_gate(*cuda_ctx, node, mulw, sl->src[0], mo, true)) {
+                GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, mm));
+                ggml_cuda_fuse_rms_norm_mul_silu_gate(*cuda_ctx, node, mulw, sl->src[0], mo, false);
+                return jo - i;
+            }
+        }
+    }
+
+    // the delta net's q and k l2 norms (RMS_NORM -> SCALE each), views between them: one launch for both
+    if (fuse_launch && node->op == GGML_OP_RMS_NORM && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        int j = i + 2;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        if (j + 1 < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_RMS_NORM && cgraph->nodes[j + 1]->op == GGML_OP_SCALE &&
+                cgraph->nodes[j]->src[0] != cgraph->nodes[i + 1] && cgraph->nodes[j]->src[0]->view_src != cgraph->nodes[i + 1] &&
+                ggml_cuda_can_fuse(cgraph, j, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {}) &&
+                ggml_cuda_fuse_rms_norm_scale2(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[j], cgraph->nodes[j + 1])) {
+            return j + 1 - i;
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
